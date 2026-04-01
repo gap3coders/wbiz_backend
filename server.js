@@ -26,6 +26,7 @@ const Contact = require('./models/Contact');
 
 const app = express();
 const storageRoot = path.join(__dirname, 'storage');
+let bootstrapped = false;
 
 fs.mkdirSync(path.join(storageRoot, 'media'), { recursive: true });
 
@@ -63,11 +64,17 @@ app.use('/api/v1/auto-responses', apiLimiter, autoResponsesRoutes);
 app.use((req, res) => res.status(404).json({ success:false, error:`Route ${req.method} ${req.originalUrl} not found` }));
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).json({ success:false, error: config.nodeEnv==='development'?err.message:'Internal server error' }); });
 
-const startServer = async () => {
+const bootstrapApp = async () => {
+  if (bootstrapped) return;
   await connectDB();
   await Contact.migrateToSinglePhoneField();
   await Message.migrateLegacyIndexesAndIds();
   await Conversation.migrateIndexesForSinglePhone();
+  bootstrapped = true;
+};
+
+const startServer = async () => {
+  await bootstrapApp();
   app.listen(config.port, () => {
     if (!config.verboseLogs) return;
     console.log(`
@@ -82,5 +89,9 @@ const startServer = async () => {
     `);
   });
 };
-startServer().catch((error) => console.error(error));
-module.exports = app;
+
+if (process.env.VERCEL !== '1') {
+  startServer().catch((error) => console.error(error));
+}
+
+module.exports = { app, bootstrapApp };
