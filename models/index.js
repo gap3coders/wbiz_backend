@@ -1,0 +1,16 @@
+module.exports = {
+  User: require('./User'),
+  Tenant: require('./Tenant'),
+  RefreshToken: require('./RefreshToken'),
+  EmailVerification: require('./EmailVerification'),
+  WhatsAppAccount: require('./WhatsAppAccount'),
+  WebhookEvent: require('./WebhookEvent'),
+  TeamMember: require('./TeamMember'),
+  Contact: require('./Contact'),
+  Message: require('./Message'),
+  Campaign: require('./Campaign'),
+  Notification: require('./Notification'),
+  MediaAsset: require('./MediaAsset'),
+  AutoResponseRule: require('./AutoResponseRule'),
+  AutoResponseLog: require('./AutoResponseLog'),
+};
