@@ -27,6 +27,8 @@ const Contact = require('./models/Contact');
 const app = express();
 const storageRoot = path.join(__dirname, 'storage');
 let bootstrapped = false;
+let bootstrapPromise = null;
+let bootstrapError = null;
 
 fs.mkdirSync(path.join(storageRoot, 'media'), { recursive: true });
 
@@ -46,35 +48,71 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use('/uploads', express.static(storageRoot, { maxAge: '1h' }));
 
-app.get('/health', (req, res) => res.json({ status:'ok', timestamp:new Date().toISOString(), uptime:process.uptime() }));
+app.get('/health', (req, res) => {
+  res.json({
+    status: bootstrapped ? 'ok' : bootstrapError ? 'error' : 'starting',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    ready: bootstrapped,
+    bootstrap_error: bootstrapError ? bootstrapError.message : null,
+  });
+});
 
-app.use('/api/v1/auth', authLimiter, authRoutes);
-app.use('/api/v1/meta', apiLimiter, metaRoutes);
-app.use('/api/v1/webhook', webhookRoutes);
-app.use('/api/v1/contacts', apiLimiter, contactsRoutes);
-app.use('/api/v1/conversations', apiLimiter, conversationsRoutes);
-app.use('/api/v1/campaigns', apiLimiter, campaignsRoutes);
-app.use('/api/v1/analytics', apiLimiter, analyticsRoutes);
-app.use('/api/v1/billing', apiLimiter, billingRoutes);
-app.use('/api/v1/notifications', apiLimiter, notificationsRoutes);
-app.use('/api/v1/logs', apiLimiter, logsRoutes);
-app.use('/api/v1/media', apiLimiter, mediaRoutes);
-app.use('/api/v1/auto-responses', apiLimiter, autoResponsesRoutes);
+app.get('/', (req, res) => {
+  res.status(200).json({
+    success: true,
+    service: 'whatsapp-saas-backend',
+    status: bootstrapped ? 'ok' : bootstrapError ? 'error' : 'starting',
+    health: '/health',
+  });
+});
+
+const readinessGuard = (req, res, next) => {
+  if (bootstrapped) return next();
+  if (bootstrapError) {
+    return res.status(503).json({ success: false, error: 'Service initialization failed', detail: bootstrapError.message });
+  }
+  return res.status(503).json({ success: false, error: 'Service is starting. Please retry shortly.' });
+};
+
+app.use('/api/v1/auth', readinessGuard, authLimiter, authRoutes);
+app.use('/api/v1/meta', readinessGuard, apiLimiter, metaRoutes);
+app.use('/api/v1/webhook', readinessGuard, webhookRoutes);
+app.use('/api/v1/contacts', readinessGuard, apiLimiter, contactsRoutes);
+app.use('/api/v1/conversations', readinessGuard, apiLimiter, conversationsRoutes);
+app.use('/api/v1/campaigns', readinessGuard, apiLimiter, campaignsRoutes);
+app.use('/api/v1/analytics', readinessGuard, apiLimiter, analyticsRoutes);
+app.use('/api/v1/billing', readinessGuard, apiLimiter, billingRoutes);
+app.use('/api/v1/notifications', readinessGuard, apiLimiter, notificationsRoutes);
+app.use('/api/v1/logs', readinessGuard, apiLimiter, logsRoutes);
+app.use('/api/v1/media', readinessGuard, apiLimiter, mediaRoutes);
+app.use('/api/v1/auto-responses', readinessGuard, apiLimiter, autoResponsesRoutes);
 
 app.use((req, res) => res.status(404).json({ success:false, error:`Route ${req.method} ${req.originalUrl} not found` }));
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).json({ success:false, error: config.nodeEnv==='development'?err.message:'Internal server error' }); });
 
 const bootstrapApp = async () => {
   if (bootstrapped) return;
-  await connectDB();
-  await Contact.migrateToSinglePhoneField();
-  await Message.migrateLegacyIndexesAndIds();
-  await Conversation.migrateIndexesForSinglePhone();
-  bootstrapped = true;
+  if (bootstrapPromise) return bootstrapPromise;
+
+  bootstrapPromise = (async () => {
+    bootstrapError = null;
+    await connectDB();
+    await Contact.migrateToSinglePhoneField();
+    await Message.migrateLegacyIndexesAndIds();
+    await Conversation.migrateIndexesForSinglePhone();
+    bootstrapped = true;
+  })().catch((error) => {
+    bootstrapError = error;
+    throw error;
+  }).finally(() => {
+    bootstrapPromise = null;
+  });
+
+  return bootstrapPromise;
 };
 
 const startServer = async () => {
-  await bootstrapApp();
   app.listen(config.port, () => {
     if (!config.verboseLogs) return;
     console.log(`
@@ -88,6 +126,7 @@ const startServer = async () => {
 ╚══════════════════════════════════════════════╝
     `);
   });
+  bootstrapApp().catch((error) => console.error(error));
 };
 
 if (process.env.VERCEL !== '1') {
