@@ -18,12 +18,21 @@ const parseTrustProxy = (value, fallback) => {
 };
 const smtpPort = parseInt(process.env.SMTP_PORT || '465', 10);
 const smtpSecure = parseBoolean(process.env.SMTP_SECURE, smtpPort === 465);
+const frontendUrls = Array.from(
+  new Set(
+    String(process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:5173')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+  )
+);
 
 module.exports = {
   port: process.env.PORT || 5000,
   nodeEnv: process.env.NODE_ENV || 'development',
   verboseLogs: (process.env.NODE_ENV || 'development') !== 'production' || parseBoolean(process.env.ENABLE_VERBOSE_LOGS),
-  frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
+  frontendUrl: frontendUrls[0] || 'http://localhost:5173',
+  frontendUrls,
   trustProxy: parseTrustProxy(
     process.env.TRUST_PROXY,
     (process.env.NODE_ENV || 'development') === 'production' ? 1 : false

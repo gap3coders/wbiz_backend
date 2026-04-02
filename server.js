@@ -36,8 +36,20 @@ fs.mkdirSync(path.join(storageRoot, 'media'), { recursive: true });
 
 app.set('trust proxy', config.trustProxy);
 
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    const allowed = new Set([config.frontendUrl, ...(config.frontendUrls || [])]);
+    if (allowed.has(origin)) return cb(null, true);
+    return cb(new Error('CORS: origin not allowed'));
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+};
+
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-app.use(cors({ origin: config.frontendUrl, credentials: true, methods: ['GET','POST','PUT','DELETE','PATCH'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.use(cors(corsOptions));
 app.use(express.json({
   limit: '50mb',
   verify: (req, res, buffer) => {
@@ -49,6 +61,7 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use('/uploads', express.static(storageRoot, { maxAge: '1h' }));
+app.options('*', cors(corsOptions));
 
 app.get('/health', (req, res) => {
   res.json({
