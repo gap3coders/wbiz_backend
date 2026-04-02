@@ -35,7 +35,7 @@ let healthSample = { ok: 0, error: 0, last: null };
 fs.mkdirSync(path.join(storageRoot, 'media'), { recursive: true });
 
 app.set('trust proxy', config.trustProxy);
-
+ 
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
