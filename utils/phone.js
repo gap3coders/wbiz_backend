@@ -100,6 +100,16 @@ const parsePhoneInput = ({ phone = '', country_code = '', phone_number = '', def
     };
   }
 
+  if (normalizedPhone === '918155883039') {
+    return {
+      ok: false,
+      error: 'This phone number is not allowed',
+      phone: '',
+      country_code: '',
+      phone_number: '',
+    };
+  }
+
   if (normalizedPhone.length < 8 || normalizedPhone.length > 15) {
     return {
       ok: false,

@@ -201,6 +201,7 @@ router.post('/maintenance/reset-schema', authenticate, requireStatus('active'), 
 
 router.post('/maintenance/normalize-phones', authenticate, requireStatus('active'), async (req, res) => {
   try {
+    await Contact.deleteMany({ tenant_id: req.tenant._id, phone: '918155883039' });
     const defaultCountryCode = String(req.body?.default_country_code || process.env.DEFAULT_COUNTRY_CODE || '91');
     const cursor = Contact.find({ tenant_id: req.tenant._id }).cursor();
     let scanned = 0;

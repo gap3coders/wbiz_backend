@@ -53,7 +53,15 @@ const normalizeTemplateComponents = (campaign, contact) => {
     const parameters = indexes.map((index) => {
       const key = `${slot}_${index}`;
       const mapping = variableMapping[key];
-      const baseText = String(baseParameters[index - 1]?.text || '').trim();
+      const baseParameter = baseParameters[index - 1] || {};
+      const hasMapping = Object.prototype.hasOwnProperty.call(variableMapping, key);
+      if (!hasMapping && baseParameter.type && baseParameter.type !== 'text') {
+        return baseParameter;
+      }
+      if (baseParameter.type && baseParameter.type !== 'text') {
+        return baseParameter;
+      }
+      const baseText = String(baseParameter.text || '').trim();
       const resolved = String(resolveVariable(mapping, contact, baseText) || '').trim();
       return { type: 'text', text: resolved || baseText || '-' };
     });
@@ -138,8 +146,11 @@ const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
       await wait(120);
     } catch (err) {
       failed += 1;
-      const errMsg = err.source === 'meta' ? `[Meta] ${err.message}` : `[Platform] ${err.message}`;
-      errors.push({ phone, error: errMsg, source: err.source || 'platform' });
+      const metaDetail = err.metaError?.error_data?.details || err.metaError?.error_user_msg || '';
+      const errMsg = err.source === 'meta'
+        ? `[Meta] ${err.message}${metaDetail ? ` | ${metaDetail}` : ''}`
+        : `[Platform] ${err.message}`;
+      errors.push({ phone, error: errMsg, source: err.source || 'platform', code: err.metaError?.code || null });
       await Message.create({
         tenant_id: tenantId,
         contact_phone: phone,
