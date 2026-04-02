@@ -29,18 +29,44 @@ const resolveVariable = (mapping, contact, fallbackText) => {
 };
 
 const normalizeTemplateComponents = (campaign, contact) => {
-  const variableEntries = Object.entries(campaign.variable_mapping || {})
-    .filter(([key]) => key.startsWith('body_'))
-    .sort((a, b) => Number(a[0].replace('body_', '')) - Number(b[0].replace('body_', '')));
+  const baseComponents = Array.isArray(campaign.template_components) ? campaign.template_components : [];
+  const variableMapping = campaign.variable_mapping || {};
+  if (!Object.keys(variableMapping).length) return baseComponents;
 
-  if (!variableEntries.length) return campaign.template_components || [];
+  const result = baseComponents.filter((component) => !['body', 'header'].includes(String(component.type || '').toLowerCase()));
+  const slots = ['header', 'body'];
 
-  const bodyParameters = variableEntries.map(([_, mapping]) => ({
-    type: 'text',
-    text: resolveVariable(mapping, contact, ''),
-  }));
+  for (const slot of slots) {
+    const keyPrefix = `${slot}_`;
+    const slotEntries = Object.entries(variableMapping).filter(([key]) => key.startsWith(keyPrefix));
+    const baseComponent = baseComponents.find((component) => String(component.type || '').toLowerCase() === slot);
+    const baseParameters = Array.isArray(baseComponent?.parameters) ? baseComponent.parameters : [];
 
-  return [{ type: 'body', parameters: bodyParameters }];
+    const indexSet = new Set([
+      ...slotEntries.map(([key]) => Number(key.replace(keyPrefix, ''))).filter((value) => Number.isFinite(value) && value > 0),
+      ...baseParameters.map((_, index) => index + 1),
+    ]);
+
+    const indexes = Array.from(indexSet).sort((a, b) => a - b);
+    if (!indexes.length) continue;
+
+    const parameters = indexes.map((index) => {
+      const key = `${slot}_${index}`;
+      const mapping = variableMapping[key];
+      const baseText = String(baseParameters[index - 1]?.text || '').trim();
+      const resolved = String(resolveVariable(mapping, contact, baseText) || '').trim();
+      return { type: 'text', text: resolved || baseText || '-' };
+    });
+
+    if (parameters.length) {
+      result.push({
+        type: slot,
+        parameters,
+      });
+    }
+  }
+
+  return result;
 };
 
 const rollupCampaignStats = async (tenantId, campaignId) => {
