@@ -7,24 +7,41 @@ const Campaign = require('../models/Campaign');
 const Contact = require('../models/Contact');
 const Message = require('../models/Message');
 const Notification = require('../models/Notification');
+const { emitToTenant } = require('../services/socketService');
 const { apiResponse } = require('../utils/helpers');
 const router = express.Router();
 
 const getWA = async (tid) => { const wa=await WhatsAppAccount.findOne({tenant_id:tid}); if(!wa) throw new Error('No account'); return {wa,token:decrypt(wa.access_token_encrypted)}; };
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const safeEmail = (value) => {
+  const normalized = String(value || '').trim();
+  return normalized || 'N/A';
+};
+
+const resolveRecipients = async ({ tenantId, targetType, targetTags, recipients }) => {
+  if (targetType === 'all') {
+    const contacts = await Contact.find({ tenant_id: tenantId, opt_in: true }).select('phone');
+    return contacts.map((contact) => contact.phone).filter(Boolean);
+  }
+  if (targetType === 'tags' && targetTags?.length) {
+    const contacts = await Contact.find({ tenant_id: tenantId, labels: { $in: targetTags }, opt_in: true }).select('phone');
+    return contacts.map((contact) => contact.phone).filter(Boolean);
+  }
+  return Array.isArray(recipients) ? recipients.filter(Boolean) : [];
+};
 
 const resolveVariable = (mapping, contact, fallbackText) => {
   if (!mapping) return fallbackText;
   if (typeof mapping === 'string') {
-    if (mapping === 'contact_name') return contact?.name || contact?.wa_name || fallbackText;
-    if (mapping === 'contact_phone') return contact?.phone || fallbackText;
-    if (mapping === 'contact_email') return contact?.email || fallbackText;
+    if (mapping === 'contact_name') return contact?.name || contact?.wa_name || fallbackText || 'N/A';
+    if (mapping === 'contact_phone') return contact?.phone || fallbackText || '-';
+    if (mapping === 'contact_email') return safeEmail(contact?.email || fallbackText);
     return fallbackText;
   }
   const source = String(mapping.source || mapping.type || 'static');
-  if (source === 'contact_name') return contact?.name || contact?.wa_name || String(mapping.value || fallbackText || '');
-  if (source === 'contact_phone') return contact?.phone || String(mapping.value || fallbackText || '');
-  if (source === 'contact_email') return contact?.email || String(mapping.value || fallbackText || '');
+  if (source === 'contact_name') return contact?.name || contact?.wa_name || String(mapping.value || fallbackText || 'N/A');
+  if (source === 'contact_phone') return contact?.phone || String(mapping.value || fallbackText || '-');
+  if (source === 'contact_email') return safeEmail(contact?.email || mapping.value || fallbackText);
   return String(mapping.value || fallbackText || '');
 };
 
@@ -104,88 +121,112 @@ const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
   const campaign = await Campaign.findOne({ _id: campaignId, tenant_id: tenantId });
   if (!campaign || !['draft', 'scheduled', 'paused', 'running'].includes(campaign.status)) return;
 
-  const { wa, token } = await getWA(tenantId);
-  if (campaign.status !== 'running') {
-    campaign.status = 'running';
-    campaign.started_at = new Date();
-    await campaign.save();
-  }
-
   let accepted = 0;
   let failed = 0;
   const errors = [];
 
-  for (const phone of campaign.recipients || []) {
-    try {
-      const contact = await Contact.findOne({ tenant_id: tenantId, phone });
-      const comps = normalizeTemplateComponents(campaign, contact);
-      const result = await metaService.sendTemplateMessage(
-        wa.phone_number_id,
-        token,
-        phone,
-        campaign.template_name,
-        campaign.template_language,
-        comps
-      );
+  try {
+    const { wa, token } = await getWA(tenantId);
+    if (campaign.status !== 'running') {
+      campaign.status = 'running';
+      campaign.started_at = new Date();
+      await campaign.save();
+    }
+    emitToTenant(tenantId, 'campaign:progress', { id: campaign._id, event: 'running' });
 
-      await Message.create({
-        tenant_id: tenantId,
-        contact_phone: phone,
-        direction: 'outbound',
-        message_type: 'template',
-        content: `[Campaign: ${campaign.name}]`,
-        template_name: campaign.template_name,
-        template_params: { components: comps },
-        wa_message_id: result.messages?.[0]?.id,
-        status: 'sent',
-        campaign_id: campaign._id,
-        sent_by: userId || null,
-        timestamp: new Date(),
-      });
-      accepted += 1;
-      await wait(120);
-    } catch (err) {
-      failed += 1;
-      const metaDetail = err.metaError?.error_data?.details || err.metaError?.error_user_msg || '';
-      const errMsg = err.source === 'meta'
-        ? `[Meta] ${err.message}${metaDetail ? ` | ${metaDetail}` : ''}`
-        : `[Platform] ${err.message}`;
-      errors.push({ phone, error: errMsg, source: err.source || 'platform', code: err.metaError?.code || null });
-      await Message.create({
-        tenant_id: tenantId,
-        contact_phone: phone,
-        direction: 'outbound',
-        message_type: 'template',
-        content: `[Campaign: ${campaign.name}]`,
-        template_name: campaign.template_name,
-        status: 'failed',
-        error_message: errMsg,
-        error_source: err.source || 'platform',
-        campaign_id: campaign._id,
-        timestamp: new Date(),
-      });
-      if (err.metaError?.code === 131026) {
-        await Contact.findOneAndUpdate({ tenant_id: tenantId, phone }, { $set: { wa_exists: 'no' } });
+    for (const phone of campaign.recipients || []) {
+      try {
+        const contact = await Contact.findOne({ tenant_id: tenantId, phone });
+        const normalizedContact = contact || { name: 'N/A', wa_name: 'N/A', email: 'N/A', phone };
+        normalizedContact.email = safeEmail(normalizedContact.email);
+        if (!normalizedContact.name && !normalizedContact.wa_name) normalizedContact.name = 'N/A';
+        const comps = normalizeTemplateComponents(campaign, normalizedContact);
+        const result = await metaService.sendTemplateMessage(
+          wa.phone_number_id,
+          token,
+          phone,
+          campaign.template_name,
+          campaign.template_language,
+          comps
+        );
+
+        await Message.create({
+          tenant_id: tenantId,
+          contact_phone: phone,
+          direction: 'outbound',
+          message_type: 'template',
+          content: `[Campaign: ${campaign.name}]`,
+          template_name: campaign.template_name,
+          template_params: { components: comps },
+          wa_message_id: result.messages?.[0]?.id,
+          status: 'sent',
+          campaign_id: campaign._id,
+          sent_by: userId || null,
+          timestamp: new Date(),
+        });
+        accepted += 1;
+        await wait(120);
+        emitToTenant(tenantId, 'campaign:progress', { id: campaign._id, event: 'accepted', contact_phone: phone });
+      } catch (err) {
+        failed += 1;
+        const metaDetail = err.metaError?.error_data?.details || err.metaError?.error_user_msg || '';
+        const errMsg = err.source === 'meta'
+          ? `[Meta] ${err.message}${metaDetail ? ` | ${metaDetail}` : ''}`
+          : `[Platform] ${err.message}`;
+        errors.push({ phone, error: errMsg, source: err.source || 'platform', code: err.metaError?.code || null });
+        await Message.create({
+          tenant_id: tenantId,
+          contact_phone: phone,
+          direction: 'outbound',
+          message_type: 'template',
+          content: `[Campaign: ${campaign.name}]`,
+          template_name: campaign.template_name,
+          status: 'failed',
+          error_message: errMsg,
+          error_source: err.source || 'platform',
+          campaign_id: campaign._id,
+          timestamp: new Date(),
+        });
+        if (err.metaError?.code === 131026) {
+          await Contact.findOneAndUpdate({ tenant_id: tenantId, phone }, { $set: { wa_exists: 'no' } });
+        }
+        emitToTenant(tenantId, 'campaign:progress', { id: campaign._id, event: 'failed', contact_phone: phone, error: errMsg });
       }
     }
+
+    await rollupCampaignStats(tenantId, campaign._id);
+
+    campaign.stats.errors = errors.slice(0, 50);
+    campaign.status = 'completed';
+    campaign.completed_at = new Date();
+    await campaign.save();
+
+    await Notification.create({
+      tenant_id: tenantId,
+      type: 'campaign_complete',
+      title: `Campaign "${campaign.name}" Completed`,
+      message: `Accepted: ${accepted}, Failed: ${failed}, Total: ${campaign.stats.total}. Delivered/read will update from webhook callbacks.`,
+      source: 'platform',
+      severity: failed > 0 ? 'warning' : 'success',
+      link: '/portal/campaigns',
+    });
+    emitToTenant(tenantId, 'campaign:progress', { id: campaign._id, event: 'completed' });
+  } catch (error) {
+    campaign.status = 'failed';
+    campaign.completed_at = new Date();
+    campaign.stats.errors = [{ phone: null, error: error.message, source: error.source || 'platform', code: error.metaError?.code || null }];
+    await campaign.save();
+    await Notification.create({
+      tenant_id: tenantId,
+      type: 'campaign_complete',
+      title: `Campaign "${campaign.name}" Failed`,
+      message: error.message || 'Campaign failed unexpectedly.',
+      source: error.source || 'platform',
+      severity: 'error',
+      link: '/portal/campaigns',
+    }).catch(() => null);
+    emitToTenant(tenantId, 'campaign:progress', { id: campaign._id, event: 'failed_terminal', error: error.message });
   }
-
-  await rollupCampaignStats(tenantId, campaign._id);
-
-  campaign.stats.errors = errors.slice(0, 50);
-  campaign.status = 'completed';
-  campaign.completed_at = new Date();
-  await campaign.save();
-
-  await Notification.create({
-    tenant_id: tenantId,
-    type: 'campaign_complete',
-    title: `Campaign "${campaign.name}" Completed`,
-    message: `Accepted: ${accepted}, Failed: ${failed}, Total: ${campaign.stats.total}. Delivered/read will update from webhook callbacks.`,
-    source: 'platform',
-    severity: failed > 0 ? 'warning' : 'success',
-    link: '/portal/campaigns',
-  });
 };
 
 router.get('/', authenticate, requireStatus('active'), async (req, res) => {
@@ -211,14 +252,12 @@ router.post('/', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const { name, template_name, template_language, template_components, variable_mapping, target_type, target_tags, recipients, scheduled_at } = req.body;
     if (!name||!template_name) return apiResponse(res, {status:400,success:false,error:'[Platform] name and template required'});
-    let phones = recipients || [];
-    if (target_type==='all') {
-      const contacts = await Contact.find({tenant_id:req.tenant._id,opt_in:true});
-      phones = contacts.map(c=>c.phone);
-    } else if (target_type==='tags' && target_tags?.length) {
-      const contacts = await Contact.find({tenant_id:req.tenant._id,labels:{$in:target_tags},opt_in:true});
-      phones = contacts.map(c=>c.phone);
-    }
+    const phones = await resolveRecipients({
+      tenantId: req.tenant._id,
+      targetType: target_type,
+      targetTags: target_tags,
+      recipients,
+    });
     const campaign = await Campaign.create({
       tenant_id:req.tenant._id, name, template_name, template_language:template_language||'en',
       template_components:template_components||[], variable_mapping:variable_mapping||{},
@@ -235,8 +274,10 @@ router.post('/', authenticate, requireStatus('active'), async (req, res) => {
           error: error.message,
         });
       });
+      emitToTenant(req.tenant._id, 'campaign:progress', { id: campaign._id, event: 'queued_start' });
       return apiResponse(res, { status: 201, data: { campaign, launch: 'started' } });
     }
+    emitToTenant(req.tenant._id, 'campaign:progress', { id: campaign._id, event: 'scheduled' });
     return apiResponse(res, {status:201,data:{campaign, launch:'scheduled'}});
   } catch(e) { return apiResponse(res, {status:500,success:false,error:`[Platform] ${e.message}`}); }
 });
@@ -253,8 +294,51 @@ router.post('/:id/launch', authenticate, requireStatus('active'), async (req, re
         error: error.message,
       });
     });
+    emitToTenant(req.tenant._id, 'campaign:progress', { id: campaign._id, event: 'queued_start' });
     res.json({success:true,data:{message:'Campaign launched'}});
   } catch(e) { if(!res.headersSent) return apiResponse(res, {status:500,success:false,error:'Failed'}); }
+});
+
+router.post('/:id/rerun', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const source = await Campaign.findOne({ _id: req.params.id, tenant_id: req.tenant._id });
+    if (!source) return apiResponse(res, { status: 404, success: false, error: 'Not found' });
+
+    const recipients = await resolveRecipients({
+      tenantId: req.tenant._id,
+      targetType: source.target_type,
+      targetTags: source.target_tags,
+      recipients: source.recipients,
+    });
+
+    const clone = await Campaign.create({
+      tenant_id: req.tenant._id,
+      name: `${source.name} (Rerun)`,
+      template_name: source.template_name,
+      template_language: source.template_language || 'en',
+      template_components: source.template_components || [],
+      variable_mapping: source.variable_mapping || {},
+      target_type: source.target_type || 'selected',
+      target_tags: source.target_tags || [],
+      recipients,
+      scheduled_at: null,
+      status: 'draft',
+      stats: { total: recipients.length, sent: 0, delivered: 0, read: 0, failed: 0, errors: [] },
+      created_by: req.user._id,
+    });
+
+    launchCampaignInBackground({ campaignId: clone._id, tenantId: req.tenant._id, userId: req.user._id }).catch((error) => {
+      console.error('[Campaign Route][Rerun Failed]', {
+        tenant_id: String(req.tenant?._id || ''),
+        campaign_id: String(clone._id),
+        error: error.message,
+      });
+    });
+    emitToTenant(req.tenant._id, 'campaign:progress', { id: clone._id, event: 'queued_start' });
+    return apiResponse(res, { data: { campaign: clone, launch: 'started', rerun_of: source._id } });
+  } catch (error) {
+    return apiResponse(res, { status: 500, success: false, error: error.message || 'Failed' });
+  }
 });
 
 router.delete('/:id', authenticate, requireStatus('active'), async (req, res) => {

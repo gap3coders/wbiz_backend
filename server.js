@@ -29,6 +29,8 @@ const storageRoot = path.join(__dirname, 'storage');
 let bootstrapped = false;
 let bootstrapPromise = null;
 let bootstrapError = null;
+let keepAliveTimer = null;
+let healthSample = { ok: 0, error: 0, last: null };
 
 fs.mkdirSync(path.join(storageRoot, 'media'), { recursive: true });
 
@@ -55,6 +57,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     ready: bootstrapped,
     bootstrap_error: bootstrapError ? bootstrapError.message : null,
+    samples: healthSample,
   });
 });
 
@@ -113,7 +116,7 @@ const bootstrapApp = async () => {
 };
 
 const startServer = async () => {
-  app.listen(config.port, () => {
+  const server = app.listen(config.port, () => {
     if (!config.verboseLogs) return;
     console.log(`
 ╔══════════════════════════════════════════════╗
@@ -127,6 +130,27 @@ const startServer = async () => {
     `);
   });
   bootstrapApp().catch((error) => console.error(error));
+
+  // Initialize socket server (if available) and keep-alive
+  try {
+    const { initializeSocketServer } = require('./services/socketService');
+    initializeSocketServer(server);
+  } catch {}
+
+  const runHealthProbe = async () => {
+    try {
+      await bootstrapApp();
+      healthSample.ok += 1;
+      healthSample.last = new Date().toISOString();
+    } catch (error) {
+      healthSample.error += 1;
+      healthSample.last = new Date().toISOString();
+      console.error('[KeepAlive] Bootstrap/health failed:', error.message);
+    }
+  };
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
+  keepAliveTimer = setInterval(runHealthProbe, 30_000);
+  runHealthProbe().catch(() => {});
 };
 
 if (process.env.VERCEL !== '1') {

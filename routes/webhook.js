@@ -10,6 +10,7 @@ const Notification = require('../models/Notification');
 const Campaign = require('../models/Campaign');
 const { processInboundAutoResponses } = require('../services/autoResponseService');
 const { parsePhoneInput } = require('../utils/phone');
+const { emitToTenant } = require('../services/socketService');
 
 const router = express.Router();
 const WEBHOOK_HANDLER_VERSION = '2026-04-01-single-phone-v6';
@@ -540,6 +541,12 @@ const processMessageChange = async (tenantId, change) => {
 
     if (updatedMessage?.campaign_id) {
       await refreshCampaignStatsFromMessages(tenantId, updatedMessage.campaign_id).catch(() => null);
+      emitToTenant(tenantId, 'campaign:progress', {
+        id: updatedMessage.campaign_id,
+        event: 'status_update',
+        wa_message_id: statusUpdate.id,
+        status: statusUpdate.status || 'unknown',
+      });
     }
 
     if (config.verboseLogs) {
