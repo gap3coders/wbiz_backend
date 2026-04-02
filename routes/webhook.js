@@ -7,6 +7,7 @@ const WhatsAppAccount = require('../models/WhatsAppAccount');
 const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Notification = require('../models/Notification');
+const { processInboundAutoResponses } = require('../services/autoResponseService');
 
 const router = express.Router();
 const WEBHOOK_HANDLER_VERSION = '2026-04-01-single-phone-v6';
@@ -423,6 +424,40 @@ const processMessageChange = async (tenantId, change) => {
       from: phone,
       message_id: inbound.id || null,
     });
+
+    try {
+      await processInboundAutoResponses({
+        tenantId,
+        inboundMessage: inbound,
+      });
+      logInboundStage('auto_response_done', {
+        tenant_id: String(tenantId),
+        from: phone,
+        message_id: inbound.id || null,
+      });
+    } catch (error) {
+      console.error('[Meta Webhook][Auto Response Failed]', {
+        version: WEBHOOK_HANDLER_VERSION,
+        tenant_id: String(tenantId),
+        from: phone,
+        message_id: inbound.id || null,
+        error: error.message,
+      });
+      await Notification.create({
+        tenant_id: tenantId,
+        type: 'webhook_error',
+        title: `Auto response processing failed`,
+        message: `[Platform] Auto response failed for ${phone}: ${error.message}`,
+        source: 'platform',
+        severity: 'error',
+        link: `/portal/auto-responses`,
+        meta_data: {
+          source: 'auto_response',
+          inbound_wa_message_id: inbound.id || null,
+          debug_marker: WEBHOOK_BOOT_MARKER,
+        },
+      }).catch(() => null);
+    }
 
     if (config.verboseLogs) {
       console.info('[Meta Webhook][Inbound Message]', {
