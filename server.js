@@ -85,10 +85,27 @@ app.get('/', (req, res) => {
 
 const readinessGuard = (req, res, next) => {
   if (bootstrapped) return next();
-  if (bootstrapError) {
-    return res.status(503).json({ success: false, error: 'Service initialization failed', detail: bootstrapError.message });
-  }
-  return res.status(503).json({ success: false, error: 'Service is starting. Please retry shortly.' });
+  const waitMs = Number(process.env.READINESS_GUARD_WAIT_MS || 1500);
+  const p = bootstrapPromise || bootstrapApp();
+  let responded = false;
+  const timer = setTimeout(() => {
+    if (responded) return;
+    responded = true;
+    if (bootstrapError) {
+      return res.status(503).json({ success: false, error: 'Service initialization failed', detail: bootstrapError.message });
+    }
+    return res.status(503).json({ success: false, error: 'Service is starting. Please retry shortly.' });
+  }, waitMs);
+  p.then(() => {
+    if (responded) return;
+    clearTimeout(timer);
+    return next();
+  }).catch((err) => {
+    bootstrapError = err;
+    if (responded) return;
+    clearTimeout(timer);
+    return res.status(503).json({ success: false, error: 'Service initialization failed', detail: err.message });
+  });
 };
 
 app.use('/api/v1/auth', readinessGuard, authLimiter, authRoutes);

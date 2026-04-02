@@ -1,4 +1,9 @@
-const { Server } = require('socket.io');
+let Server = null;
+try {
+  Server = require('socket.io').Server;
+} catch {
+  Server = null;
+}
 const jwt = require('jsonwebtoken');
 const config = require('../config');
 
@@ -7,9 +12,13 @@ let io = null;
 const roomForTenant = (tenantId) => `tenant:${tenantId}`;
 
 const initializeSocketServer = (httpServer) => {
+  if (!Server) {
+    if (config.verboseLogs) console.log('[Socket] socket.io not installed; socket server disabled');
+    return null;
+  }
   io = new Server(httpServer, {
     cors: {
-      origin: config.frontendUrl,
+      origin: config.frontendUrls || config.frontendUrl,
       credentials: true,
       methods: ['GET', 'POST'],
     },
