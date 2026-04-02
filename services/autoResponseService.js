@@ -6,6 +6,7 @@ const Message = require('../models/Message');
 const Notification = require('../models/Notification');
 const metaService = require('./metaService');
 const { decrypt } = require('./encryptionService');
+const { parsePhoneInput } = require('../utils/phone');
 
 const normalizePhone = (value = '') => String(value || '').replace(/[^\d]/g, '');
 const normalizeText = (value = '') => String(value || '').trim().toLowerCase();
@@ -146,7 +147,8 @@ const storeOutboundMessage = async ({
   waMessageId,
   templateName = null,
 }) => {
-  const normalizedPhone = normalizePhone(phone);
+  const parsedPhone = parsePhoneInput({ phone });
+  const normalizedPhone = parsedPhone.phone || normalizePhone(phone);
   const contact = await Contact.findOneAndUpdate(
     {
       tenant_id: tenantId,
@@ -155,6 +157,8 @@ const storeOutboundMessage = async ({
     {
       $set: {
         phone: normalizedPhone,
+        country_code: parsedPhone.country_code || '',
+        phone_number: parsedPhone.phone_number || '',
         whatsapp_id: normalizedPhone,
         wa_exists: 'yes',
         last_message_at: new Date(),

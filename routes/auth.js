@@ -9,6 +9,7 @@ const EmailVerification = require('../models/EmailVerification');
 const { authenticate } = require('../middleware/auth');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 const { generateToken, hashToken, createSlug, apiResponse } = require('../utils/helpers');
+const { parsePhoneInput } = require('../utils/phone');
 
 const router = express.Router();
 const localhostPattern = /(^|:\/\/)(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i;
@@ -33,6 +34,8 @@ router.post('/register', async (req, res) => {
       full_name, email, password, confirm_password,
       phone, company_name, country, industry, whatsapp_number
     } = req.body;
+    const parsedPhone = parsePhoneInput({ phone });
+    const parsedWhatsAppNumber = whatsapp_number ? parsePhoneInput({ phone: whatsapp_number }) : { ok: true, phone: null };
 
     // Validation
     const errors = [];
@@ -43,6 +46,8 @@ router.post('/register', async (req, res) => {
     if (!/[0-9]/.test(password)) errors.push('Password must contain at least 1 number');
     if (password !== confirm_password) errors.push('Passwords do not match');
     if (!phone) errors.push('Phone number is required');
+    if (phone && !parsedPhone.ok) errors.push(parsedPhone.error);
+    if (whatsapp_number && !parsedWhatsAppNumber.ok) errors.push(`WhatsApp number: ${parsedWhatsAppNumber.error}`);
     if (!company_name) errors.push('Company name is required');
     if (!country) errors.push('Country is required');
 
@@ -61,11 +66,11 @@ router.post('/register', async (req, res) => {
       email: email.toLowerCase(),
       password_hash: password, // Pre-save hook handles hashing
       full_name: full_name.trim(),
-      phone,
+      phone: parsedPhone.phone,
       company_name,
       country,
       industry: industry || null,
-      whatsapp_number: whatsapp_number || null,
+      whatsapp_number: parsedWhatsAppNumber.phone || null,
       status: 'pending_verification',
       role: 'owner',
       tenant_id: null,

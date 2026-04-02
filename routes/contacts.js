@@ -4,6 +4,7 @@ const Contact = require('../models/Contact');
 const Message = require('../models/Message');
 const WhatsAppAccount = require('../models/WhatsAppAccount');
 const { apiResponse } = require('../utils/helpers');
+const { parsePhoneInput } = require('../utils/phone');
 
 const router = express.Router();
 
@@ -23,16 +24,23 @@ const normalizeTags = (value) =>
     )
   );
 
-const normalizePhone = (value) => String(value || '').replace(/[^\d]/g, '');
+const normalizePhone = (value) => parsePhoneInput({ phone: value }).phone || '';
 
 const toClientContact = (contact = {}) => {
   const labels = normalizeTags(contact.labels?.length ? contact.labels : contact.tags);
-  const phone = normalizePhone(contact.phone || contact.whatsapp_id);
+  const parsedPhone = parsePhoneInput({
+    phone: contact.phone || contact.whatsapp_id,
+    country_code: contact.country_code,
+    phone_number: contact.phone_number,
+  });
+  const phone = parsedPhone.phone;
   const waName = String(contact.wa_name || contact.profile_name || '').trim();
 
   return {
     ...contact,
     phone,
+    country_code: parsedPhone.country_code || '',
+    phone_number: parsedPhone.phone_number || '',
     wa_name: waName,
     profile_name: waName,
     labels,
@@ -169,9 +177,6 @@ router.post('/maintenance/reset-schema', authenticate, requireStatus('active'), 
             },
           },
         },
-        {
-          $unset: ['phone_number'],
-        },
       ]
     );
 
@@ -194,16 +199,75 @@ router.post('/maintenance/reset-schema', authenticate, requireStatus('active'), 
   }
 });
 
-router.post('/', authenticate, requireStatus('active'), async (req, res) => {
+router.post('/maintenance/normalize-phones', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const { phone, name, email, labels, notes, custom_fields } = req.body || {};
-    const normalizedPhone = normalizePhone(phone);
+    const defaultCountryCode = String(req.body?.default_country_code || process.env.DEFAULT_COUNTRY_CODE || '91');
+    const cursor = Contact.find({ tenant_id: req.tenant._id }).cursor();
+    let scanned = 0;
+    let updated = 0;
+    let skipped = 0;
 
-    if (!normalizedPhone) {
-      return apiResponse(res, { status: 400, success: false, error: '[Platform] Phone required' });
+    for await (const contact of cursor) {
+      scanned += 1;
+      const parsedPhone = parsePhoneInput({
+        phone: contact.phone || contact.whatsapp_id,
+        country_code: contact.country_code,
+        phone_number: contact.phone_number,
+        default_country_code: defaultCountryCode,
+      });
+
+      if (!parsedPhone.ok) {
+        skipped += 1;
+        continue;
+      }
+
+      const changed =
+        String(contact.phone || '') !== parsedPhone.phone ||
+        String(contact.country_code || '') !== parsedPhone.country_code ||
+        String(contact.phone_number || '') !== parsedPhone.phone_number ||
+        String(contact.whatsapp_id || '') !== parsedPhone.phone;
+
+      if (!changed) continue;
+
+      contact.phone = parsedPhone.phone;
+      contact.country_code = parsedPhone.country_code;
+      contact.phone_number = parsedPhone.phone_number;
+      contact.whatsapp_id = parsedPhone.phone;
+      await contact.save();
+      updated += 1;
     }
 
-    const existing = await Contact.findOne(contactLookupQuery(req.tenant._id, normalizedPhone));
+    return apiResponse(res, {
+      data: {
+        scanned,
+        updated,
+        skipped,
+        default_country_code: defaultCountryCode,
+      },
+    });
+  } catch (error) {
+    console.error('[Contacts Route][Normalize Phones Failed]', {
+      tenant_id: String(req.tenant?._id || ''),
+      error: error.message,
+    });
+    return apiResponse(res, {
+      status: 500,
+      success: false,
+      error: '[Platform] Failed to normalize contact phone data',
+    });
+  }
+});
+
+router.post('/', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const { phone, country_code, phone_number, name, email, labels, notes, custom_fields } = req.body || {};
+    const parsedPhone = parsePhoneInput({ phone, country_code, phone_number });
+
+    if (!parsedPhone.ok) {
+      return apiResponse(res, { status: 400, success: false, error: `[Platform] ${parsedPhone.error}` });
+    }
+
+    const existing = await Contact.findOne(contactLookupQuery(req.tenant._id, parsedPhone.phone));
     if (existing) {
       return apiResponse(res, { status: 409, success: false, error: '[Platform] Contact already exists' });
     }
@@ -211,8 +275,10 @@ router.post('/', authenticate, requireStatus('active'), async (req, res) => {
     const normalizedLabels = normalizeTags(labels);
     const contact = await Contact.create({
       tenant_id: req.tenant._id,
-      phone: normalizedPhone,
-      whatsapp_id: normalizedPhone,
+      phone: parsedPhone.phone,
+      country_code: parsedPhone.country_code,
+      phone_number: parsedPhone.phone_number,
+      whatsapp_id: parsedPhone.phone,
       name: name || '',
       email: email || '',
       labels: normalizedLabels,
@@ -277,11 +343,19 @@ router.put('/:id', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const payload = { ...req.body };
 
-    if (payload.phone !== undefined || payload.phone_number !== undefined) {
-      const normalizedPhone = normalizePhone(payload.phone || payload.phone_number);
-      payload.phone = normalizedPhone;
-      payload.whatsapp_id = normalizedPhone;
-      delete payload.phone_number;
+    if (payload.phone !== undefined || payload.phone_number !== undefined || payload.country_code !== undefined) {
+      const parsedPhone = parsePhoneInput({
+        phone: payload.phone,
+        country_code: payload.country_code,
+        phone_number: payload.phone_number,
+      });
+      if (!parsedPhone.ok) {
+        return apiResponse(res, { status: 400, success: false, error: `[Platform] ${parsedPhone.error}` });
+      }
+      payload.phone = parsedPhone.phone;
+      payload.country_code = parsedPhone.country_code;
+      payload.phone_number = parsedPhone.phone_number;
+      payload.whatsapp_id = parsedPhone.phone;
     }
 
     if (payload.labels !== undefined || payload.tags !== undefined) {
@@ -346,16 +420,28 @@ router.post('/verify-whatsapp', authenticate, requireStatus('active'), async (re
 
     const results = [];
     for (const phone of phones.slice(0, 20)) {
-      const normalizedPhone = normalizePhone(phone);
+      const parsedPhone = parsePhoneInput({ phone });
+      if (!parsedPhone.ok) {
+        results.push({ phone: String(phone || ''), status: 'error', error: parsedPhone.error });
+        continue;
+      }
       try {
         await Contact.findOneAndUpdate(
-          contactLookupQuery(req.tenant._id, normalizedPhone),
-          { $set: { last_checked_at: new Date(), phone: normalizedPhone, whatsapp_id: normalizedPhone } },
+          contactLookupQuery(req.tenant._id, parsedPhone.phone),
+          {
+            $set: {
+              last_checked_at: new Date(),
+              phone: parsedPhone.phone,
+              country_code: parsedPhone.country_code,
+              phone_number: parsedPhone.phone_number,
+              whatsapp_id: parsedPhone.phone,
+            },
+          },
           { upsert: false }
         );
-        results.push({ phone: normalizedPhone, status: 'pending_verification' });
+        results.push({ phone: parsedPhone.phone, status: 'pending_verification' });
       } catch (error) {
-        results.push({ phone: normalizedPhone, status: 'error', error: error.message });
+        results.push({ phone: parsedPhone.phone, status: 'error', error: error.message });
       }
     }
 
@@ -389,36 +475,42 @@ router.post('/import', authenticate, requireStatus('active'), async (req, res) =
 
     for (const [index, row] of rows.entries()) {
       const rowNumber = parsePositiveInt(row?.row_number, index + 2);
-      const normalizedPhone = normalizePhone(row?.phone);
-      if (!normalizedPhone) {
+      const parsedPhone = parsePhoneInput({
+        phone: row?.phone,
+        country_code: row?.country_code,
+        phone_number: row?.phone_number,
+      });
+      if (!parsedPhone.ok) {
         skipped += 1;
         results.push({
           row_number: rowNumber,
           phone: '',
           name: String(row?.name || '').trim(),
           status: 'skipped',
-          reason: 'Phone is required',
+          reason: parsedPhone.error,
         });
         continue;
       }
 
-      if (seenPhones.has(normalizedPhone)) {
+      if (seenPhones.has(parsedPhone.phone)) {
         skipped += 1;
         results.push({
           row_number: rowNumber,
-          phone: normalizedPhone,
+          phone: parsedPhone.phone,
           name: String(row?.name || '').trim(),
           status: 'skipped',
           reason: 'Duplicate phone found in the uploaded file',
         });
         continue;
       }
-      seenPhones.add(normalizedPhone);
+      seenPhones.add(parsedPhone.phone);
 
       const normalizedLabels = normalizeTags(row?.labels);
       const payload = {
-        phone: normalizedPhone,
-        whatsapp_id: normalizedPhone,
+        phone: parsedPhone.phone,
+        country_code: parsedPhone.country_code,
+        phone_number: parsedPhone.phone_number,
+        whatsapp_id: parsedPhone.phone,
         name: row?.name || '',
         email: row?.email || '',
         labels: normalizedLabels,
@@ -431,7 +523,7 @@ router.post('/import', authenticate, requireStatus('active'), async (req, res) =
       };
 
       try {
-        const existing = await Contact.findOne(contactLookupQuery(req.tenant._id, normalizedPhone))
+        const existing = await Contact.findOne(contactLookupQuery(req.tenant._id, parsedPhone.phone))
           .select('_id')
           .lean();
 
@@ -443,7 +535,7 @@ router.post('/import', authenticate, requireStatus('active'), async (req, res) =
           updated += 1;
           results.push({
             row_number: rowNumber,
-            phone: normalizedPhone,
+            phone: parsedPhone.phone,
             name: String(row?.name || '').trim(),
             status: 'updated',
             reason: 'Existing contact updated by phone number',
@@ -456,7 +548,7 @@ router.post('/import', authenticate, requireStatus('active'), async (req, res) =
           created += 1;
           results.push({
             row_number: rowNumber,
-            phone: normalizedPhone,
+            phone: parsedPhone.phone,
             name: String(row?.name || '').trim(),
             status: 'created',
             reason: null,
@@ -465,14 +557,14 @@ router.post('/import', authenticate, requireStatus('active'), async (req, res) =
       } catch (error) {
         console.warn('[Contacts Route][Import Row Skipped]', {
           tenant_id: String(req.tenant?._id || ''),
-          phone: normalizedPhone,
+          phone: parsedPhone.phone,
           row_number: rowNumber,
           error: error.message,
         });
         skipped += 1;
         results.push({
           row_number: rowNumber,
-          phone: normalizedPhone,
+          phone: parsedPhone.phone,
           name: String(row?.name || '').trim(),
           status: 'skipped',
           reason: error.message,

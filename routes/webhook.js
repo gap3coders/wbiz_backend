@@ -8,6 +8,7 @@ const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Notification = require('../models/Notification');
 const { processInboundAutoResponses } = require('../services/autoResponseService');
+const { parsePhoneInput } = require('../utils/phone');
 
 const router = express.Router();
 const WEBHOOK_HANDLER_VERSION = '2026-04-01-single-phone-v6';
@@ -68,12 +69,16 @@ const logWebhookCritical = (stage, payload = {}) => {
 const upsertContact = async ({ tenantId, phone, name = '' }) => {
   try {
     logInboundStage('contact_lookup_start', { tenant_id: String(tenantId), phone });
+    const parsedPhone = parsePhoneInput({ phone });
+    const resolvedPhone = parsedPhone.phone || phone;
 
     const tenantObjectId = toObjectId(tenantId);
     const now = new Date();
     const setFields = {
-      phone,
-      whatsapp_id: phone,
+      phone: resolvedPhone,
+      country_code: parsedPhone.country_code || '',
+      phone_number: parsedPhone.phone_number || '',
+      whatsapp_id: resolvedPhone,
       wa_name: name,
       profile_name: name,
       last_message_at: now,
@@ -85,15 +90,17 @@ const upsertContact = async ({ tenantId, phone, name = '' }) => {
     if (name) setFields.name = name;
 
     const collection = Contact.collection;
-    const phoneQuery = { tenant_id: tenantObjectId, phone };
+    const phoneQuery = { tenant_id: tenantObjectId, phone: resolvedPhone };
     let writeResult = await collection.updateOne(phoneQuery, { $set: setFields });
 
     if (!writeResult.matchedCount) {
       try {
         await collection.insertOne({
           tenant_id: tenantObjectId,
-          phone,
-          whatsapp_id: phone,
+          phone: resolvedPhone,
+          country_code: parsedPhone.country_code || '',
+          phone_number: parsedPhone.phone_number || '',
+          whatsapp_id: resolvedPhone,
           name: name || '',
           wa_name: name,
           profile_name: name,
@@ -114,7 +121,7 @@ const upsertContact = async ({ tenantId, phone, name = '' }) => {
     const contact = await collection.findOne(
       {
         tenant_id: tenantObjectId,
-        phone,
+        phone: resolvedPhone,
       },
       {
         projection: { _id: 1, phone: 1, whatsapp_id: 1, name: 1, wa_name: 1, profile_name: 1 },

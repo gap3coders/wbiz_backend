@@ -1,9 +1,12 @@
 const mongoose = require('mongoose');
+const { parsePhoneInput } = require('../utils/phone');
 
 const contactSchema = new mongoose.Schema(
   {
     tenant_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true },
     phone: { type: String, required: true, trim: true },
+    country_code: { type: String, default: '', trim: true },
+    phone_number: { type: String, default: '', trim: true },
     name: { type: String, default: '', trim: true },
     wa_name: { type: String, default: '' },
     profile_name: { type: String, default: '' },
@@ -25,8 +28,16 @@ const contactSchema = new mongoose.Schema(
 );
 
 contactSchema.pre('save', function syncLegacyAndPortalFields(next) {
-  const normalizedPhone = String(this.phone || '').trim();
+  const parsedPhone = parsePhoneInput({
+    phone: this.phone,
+    country_code: this.country_code,
+    phone_number: this.phone_number,
+  });
+
+  const normalizedPhone = parsedPhone.phone || String(this.phone || '').trim();
   this.phone = normalizedPhone;
+  this.country_code = parsedPhone.country_code || '';
+  this.phone_number = parsedPhone.phone_number || '';
   this.whatsapp_id = this.whatsapp_id || normalizedPhone;
 
   const displayName = String(this.wa_name || this.profile_name || '').trim();
@@ -79,10 +90,9 @@ contactSchema.statics.migrateToSinglePhoneField = async function migrateToSingle
               },
             ],
           },
+          country_code: { $ifNull: ['$country_code', ''] },
+          phone_number: { $ifNull: ['$phone_number', ''] },
         },
-      },
-      {
-        $unset: ['phone_number'],
       },
     ]
   ).catch(() => {});
