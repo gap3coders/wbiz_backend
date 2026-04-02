@@ -33,8 +33,36 @@ router.get('/', authenticate, requireStatus('active'), async (req, res) => {
     ];
     if (search) pipeline.push({ $match:{ $or:[{contact_name:{$regex:search,$options:'i'}},{contact_phone:{$regex:search,$options:'i'}}] } });
     pipeline.push({ $limit: 50 });
-    const convos = await Message.aggregate(pipeline);
-    return apiResponse(res, { data:{ conversations:convos } });
+    const [convos, unreadAgg] = await Promise.all([
+      Message.aggregate(pipeline),
+      Message.aggregate([
+        { $match: { tenant_id: req.tenant._id, direction: 'inbound', status: { $ne: 'read' } } },
+        { $group: { _id: null, unread_count: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const phones = Array.from(new Set(convos.map((item) => normalizePhone(item.contact_phone)).filter(Boolean)));
+    const contacts = phones.length
+      ? await Contact.find({ tenant_id: req.tenant._id, phone: { $in: phones } })
+        .select('phone name wa_name profile_name email wa_exists')
+        .lean()
+      : [];
+    const contactsByPhone = new Map(contacts.map((item) => [normalizePhone(item.phone), item]));
+
+    const conversations = convos.map((item) => {
+      const normalizedPhone = normalizePhone(item.contact_phone);
+      const contact = contactsByPhone.get(normalizedPhone) || null;
+      return {
+        ...item,
+        contact_name: contact?.name || contact?.wa_name || contact?.profile_name || item.contact_name || item.contact_phone || '',
+        name: contact?.name || '',
+        wa_name: contact?.wa_name || '',
+        contact_email: contact?.email || '',
+        wa_exists: contact?.wa_exists || 'unknown',
+      };
+    });
+
+    return apiResponse(res, { data:{ conversations, counts: { unread: unreadAgg?.[0]?.unread_count || 0 } } });
   } catch(e) { return apiResponse(res, { status:500, success:false, error:'Failed' }); }
 });
 

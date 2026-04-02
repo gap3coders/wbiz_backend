@@ -11,6 +11,145 @@ const { apiResponse } = require('../utils/helpers');
 const router = express.Router();
 
 const getWA = async (tid) => { const wa=await WhatsAppAccount.findOne({tenant_id:tid}); if(!wa) throw new Error('No account'); return {wa,token:decrypt(wa.access_token_encrypted)}; };
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const resolveVariable = (mapping, contact, fallbackText) => {
+  if (!mapping) return fallbackText;
+  if (typeof mapping === 'string') {
+    if (mapping === 'contact_name') return contact?.name || contact?.wa_name || fallbackText;
+    if (mapping === 'contact_phone') return contact?.phone || fallbackText;
+    if (mapping === 'contact_email') return contact?.email || fallbackText;
+    return fallbackText;
+  }
+  const source = String(mapping.source || mapping.type || 'static');
+  if (source === 'contact_name') return contact?.name || contact?.wa_name || String(mapping.value || fallbackText || '');
+  if (source === 'contact_phone') return contact?.phone || String(mapping.value || fallbackText || '');
+  if (source === 'contact_email') return contact?.email || String(mapping.value || fallbackText || '');
+  return String(mapping.value || fallbackText || '');
+};
+
+const normalizeTemplateComponents = (campaign, contact) => {
+  const variableEntries = Object.entries(campaign.variable_mapping || {})
+    .filter(([key]) => key.startsWith('body_'))
+    .sort((a, b) => Number(a[0].replace('body_', '')) - Number(b[0].replace('body_', '')));
+
+  if (!variableEntries.length) return campaign.template_components || [];
+
+  const bodyParameters = variableEntries.map(([_, mapping]) => ({
+    type: 'text',
+    text: resolveVariable(mapping, contact, ''),
+  }));
+
+  return [{ type: 'body', parameters: bodyParameters }];
+};
+
+const rollupCampaignStats = async (tenantId, campaignId) => {
+  const rows = await Message.aggregate([
+    { $match: { tenant_id: tenantId, campaign_id: campaignId } },
+    { $group: { _id: '$status', count: { $sum: 1 } } },
+  ]);
+  const stats = { queued: 0, sent: 0, delivered: 0, read: 0, failed: 0 };
+  rows.forEach((row) => {
+    stats[row._id] = row.count;
+  });
+  const successful = (stats.delivered || 0) + (stats.read || 0);
+  await Campaign.findOneAndUpdate(
+    { _id: campaignId, tenant_id: tenantId },
+    {
+      $set: {
+        'stats.sent': successful,
+        'stats.delivered': stats.delivered || 0,
+        'stats.read': stats.read || 0,
+        'stats.failed': stats.failed || 0,
+      },
+    }
+  );
+};
+
+const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
+  const campaign = await Campaign.findOne({ _id: campaignId, tenant_id: tenantId });
+  if (!campaign || !['draft', 'scheduled', 'paused', 'running'].includes(campaign.status)) return;
+
+  const { wa, token } = await getWA(tenantId);
+  if (campaign.status !== 'running') {
+    campaign.status = 'running';
+    campaign.started_at = new Date();
+    await campaign.save();
+  }
+
+  let accepted = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const phone of campaign.recipients || []) {
+    try {
+      const contact = await Contact.findOne({ tenant_id: tenantId, phone });
+      const comps = normalizeTemplateComponents(campaign, contact);
+      const result = await metaService.sendTemplateMessage(
+        wa.phone_number_id,
+        token,
+        phone,
+        campaign.template_name,
+        campaign.template_language,
+        comps
+      );
+
+      await Message.create({
+        tenant_id: tenantId,
+        contact_phone: phone,
+        direction: 'outbound',
+        message_type: 'template',
+        content: `[Campaign: ${campaign.name}]`,
+        template_name: campaign.template_name,
+        template_params: { components: comps },
+        wa_message_id: result.messages?.[0]?.id,
+        status: 'sent',
+        campaign_id: campaign._id,
+        sent_by: userId || null,
+        timestamp: new Date(),
+      });
+      accepted += 1;
+      await wait(120);
+    } catch (err) {
+      failed += 1;
+      const errMsg = err.source === 'meta' ? `[Meta] ${err.message}` : `[Platform] ${err.message}`;
+      errors.push({ phone, error: errMsg, source: err.source || 'platform' });
+      await Message.create({
+        tenant_id: tenantId,
+        contact_phone: phone,
+        direction: 'outbound',
+        message_type: 'template',
+        content: `[Campaign: ${campaign.name}]`,
+        template_name: campaign.template_name,
+        status: 'failed',
+        error_message: errMsg,
+        error_source: err.source || 'platform',
+        campaign_id: campaign._id,
+        timestamp: new Date(),
+      });
+      if (err.metaError?.code === 131026) {
+        await Contact.findOneAndUpdate({ tenant_id: tenantId, phone }, { $set: { wa_exists: 'no' } });
+      }
+    }
+  }
+
+  await rollupCampaignStats(tenantId, campaign._id);
+
+  campaign.stats.errors = errors.slice(0, 50);
+  campaign.status = 'completed';
+  campaign.completed_at = new Date();
+  await campaign.save();
+
+  await Notification.create({
+    tenant_id: tenantId,
+    type: 'campaign_complete',
+    title: `Campaign "${campaign.name}" Completed`,
+    message: `Accepted: ${accepted}, Failed: ${failed}, Total: ${campaign.stats.total}. Delivered/read will update from webhook callbacks.`,
+    source: 'platform',
+    severity: failed > 0 ? 'warning' : 'success',
+    link: '/portal/campaigns',
+  });
+};
 
 router.get('/', authenticate, requireStatus('active'), async (req, res) => {
   try { const campaigns = await Campaign.find({tenant_id:req.tenant._id}).sort({created_at:-1}).limit(50); return apiResponse(res, {data:{campaigns}}); }
@@ -50,7 +189,18 @@ router.post('/', authenticate, requireStatus('active'), async (req, res) => {
       scheduled_at:scheduled_at||null, status:scheduled_at?'scheduled':'draft',
       stats:{total:phones.length}, created_by:req.user._id,
     });
-    return apiResponse(res, {status:201,data:{campaign}});
+
+    if (!scheduled_at) {
+      launchCampaignInBackground({ campaignId: campaign._id, tenantId: req.tenant._id, userId: req.user._id }).catch((error) => {
+        console.error('[Campaign Route][Auto Launch Failed]', {
+          tenant_id: String(req.tenant?._id || ''),
+          campaign_id: String(campaign._id),
+          error: error.message,
+        });
+      });
+      return apiResponse(res, { status: 201, data: { campaign, launch: 'started' } });
+    }
+    return apiResponse(res, {status:201,data:{campaign, launch:'scheduled'}});
   } catch(e) { return apiResponse(res, {status:500,success:false,error:`[Platform] ${e.message}`}); }
 });
 
@@ -59,51 +209,14 @@ router.post('/:id/launch', authenticate, requireStatus('active'), async (req, re
     const campaign = await Campaign.findOne({_id:req.params.id,tenant_id:req.tenant._id});
     if (!campaign) return apiResponse(res, {status:404,success:false,error:'Not found'});
     if (!['draft','scheduled','paused'].includes(campaign.status)) return apiResponse(res, {status:400,success:false,error:'Cannot launch'});
-    const {wa,token} = await getWA(req.tenant._id);
-    campaign.status='running'; campaign.started_at=new Date(); await campaign.save();
+    launchCampaignInBackground({ campaignId: campaign._id, tenantId: req.tenant._id, userId: req.user._id }).catch((error) => {
+      console.error('[Campaign Route][Launch Failed]', {
+        tenant_id: String(req.tenant?._id || ''),
+        campaign_id: String(campaign._id),
+        error: error.message,
+      });
+    });
     res.json({success:true,data:{message:'Campaign launched'}});
-
-    let sent=0,failed=0;
-    const errors = [];
-    for (const phone of campaign.recipients) {
-      try {
-        // Build dynamic components per contact
-        let comps = campaign.template_components || [];
-        if (campaign.variable_mapping && Object.keys(campaign.variable_mapping).length) {
-          const contact = await Contact.findOne({tenant_id:req.tenant._id,phone});
-          if (contact) {
-            comps = comps.map(c => {
-              if (c.type==='body' && c.parameters) {
-                return {...c, parameters: c.parameters.map((p,i) => {
-                  const mapping = campaign.variable_mapping[`body_${i+1}`];
-                  if (mapping === 'contact_name') return {...p, text: contact.name || p.text};
-                  if (mapping === 'contact_phone') return {...p, text: contact.phone || p.text};
-                  if (mapping === 'contact_email') return {...p, text: contact.email || p.text};
-                  return p;
-                })};
-              }
-              return c;
-            });
-          }
-        }
-        const result = await metaService.sendTemplateMessage(wa.phone_number_id,token,phone,campaign.template_name,campaign.template_language,comps);
-        await Message.create({tenant_id:req.tenant._id,contact_phone:phone,direction:'outbound',message_type:'template',content:`[Campaign: ${campaign.name}]`,template_name:campaign.template_name,wa_message_id:result.messages?.[0]?.id,status:'sent',campaign_id:campaign._id,sent_by:req.user._id,timestamp:new Date()});
-        sent++;
-        await new Promise(r=>setTimeout(r,100));
-      } catch(err) {
-        failed++;
-        const errMsg = err.source==='meta' ? `[Meta] ${err.message}` : `[Platform] ${err.message}`;
-        errors.push({phone,error:errMsg,source:err.source||'platform'});
-        await Message.create({tenant_id:req.tenant._id,contact_phone:phone,direction:'outbound',message_type:'template',content:`[Campaign: ${campaign.name}]`,template_name:campaign.template_name,status:'failed',error_message:errMsg,error_source:err.source||'platform',campaign_id:campaign._id,timestamp:new Date()});
-        // Mark contact if WA not available
-        if (err.metaError?.code === 131026) {
-          await Contact.findOneAndUpdate({tenant_id:req.tenant._id,phone},{$set:{wa_exists:'no'}});
-        }
-      }
-    }
-    campaign.stats.sent=sent; campaign.stats.failed=failed; campaign.stats.errors=errors.slice(0,50);
-    campaign.status='completed'; campaign.completed_at=new Date(); await campaign.save();
-    await Notification.create({tenant_id:req.tenant._id,type:'campaign_complete',title:`Campaign "${campaign.name}" Completed`,message:`Sent: ${sent}, Failed: ${failed} out of ${campaign.stats.total} recipients.`,source:'platform',severity:failed>0?'warning':'success',link:'/portal/campaigns'});
   } catch(e) { if(!res.headersSent) return apiResponse(res, {status:500,success:false,error:'Failed'}); }
 });
 

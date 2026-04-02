@@ -7,6 +7,7 @@ const WhatsAppAccount = require('../models/WhatsAppAccount');
 const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Notification = require('../models/Notification');
+const Campaign = require('../models/Campaign');
 const { processInboundAutoResponses } = require('../services/autoResponseService');
 const { parsePhoneInput } = require('../utils/phone');
 
@@ -64,6 +65,29 @@ const logWebhookCritical = (stage, payload = {}) => {
     stage,
     ...payload,
   });
+};
+
+const refreshCampaignStatsFromMessages = async (tenantId, campaignId) => {
+  const grouped = await Message.aggregate([
+    { $match: { tenant_id: tenantId, campaign_id: campaignId } },
+    { $group: { _id: '$status', count: { $sum: 1 } } },
+  ]);
+  const counters = { delivered: 0, read: 0, failed: 0 };
+  grouped.forEach((row) => {
+    if (Object.prototype.hasOwnProperty.call(counters, row._id)) counters[row._id] = row.count;
+  });
+  const successful = counters.delivered + counters.read;
+  await Campaign.findOneAndUpdate(
+    { _id: campaignId, tenant_id: tenantId },
+    {
+      $set: {
+        'stats.sent': successful,
+        'stats.delivered': counters.delivered,
+        'stats.read': counters.read,
+        'stats.failed': counters.failed,
+      },
+    }
+  );
 };
 
 const upsertContact = async ({ tenantId, phone, name = '' }) => {
@@ -496,7 +520,7 @@ const processMessageChange = async (tenantId, change) => {
       });
     }
 
-    await Message.findOneAndUpdate(
+    const updatedMessage = await Message.findOneAndUpdate(
       { tenant_id: tenantId, wa_message_id: statusUpdate.id },
       {
         $set: update,
@@ -513,6 +537,10 @@ const processMessageChange = async (tenantId, change) => {
       },
       { upsert: true, new: true }
     );
+
+    if (updatedMessage?.campaign_id) {
+      await refreshCampaignStatsFromMessages(tenantId, updatedMessage.campaign_id).catch(() => null);
+    }
 
     if (config.verboseLogs) {
       console.info('[Meta Webhook][Status Update]', {
