@@ -39,7 +39,22 @@ const interpolateText = (template = '', context = {}) =>
 
 const buildTemplateComponents = (rule, context) => {
   const variables = Array.isArray(rule.template_variables) ? rule.template_variables : [];
-  if (!variables.length) return [];
+  const components = [];
+
+  if (['image', 'video', 'document'].includes(String(rule.template_header_type || '').toLowerCase()) && String(rule.template_header_media_url || '').trim()) {
+    const headerType = String(rule.template_header_type || '').toLowerCase();
+    components.push({
+      type: 'header',
+      parameters: [
+        {
+          type: headerType,
+          [headerType]: { link: String(rule.template_header_media_url || '').trim() },
+        },
+      ],
+    });
+  }
+
+  if (!variables.length) return components;
 
   const bodyParameters = variables
     .filter((variable) => !String(variable.key || '').startsWith('header_'))
@@ -53,7 +68,8 @@ const buildTemplateComponents = (rule, context) => {
       return { type: 'text', text: value || `{{${variable.key}}}` };
     });
 
-  return bodyParameters.length ? [{ type: 'body', parameters: bodyParameters }] : [];
+  if (bodyParameters.length) components.push({ type: 'body', parameters: bodyParameters });
+  return components;
 };
 
 const parseMinutes = (value) => {
@@ -146,6 +162,7 @@ const storeOutboundMessage = async ({
   content,
   waMessageId,
   templateName = null,
+  templateParams = null,
 }) => {
   const parsedPhone = parsePhoneInput({ phone });
   const normalizedPhone = parsedPhone.phone || normalizePhone(phone);
@@ -176,6 +193,7 @@ const storeOutboundMessage = async ({
     message_type: messageType,
     content,
     template_name: templateName,
+    template_params: templateParams,
     wa_message_id: waMessageId,
     status: 'sent',
     timestamp: new Date(),
@@ -241,22 +259,44 @@ const executeRule = async ({ tenantId, rule, inboundMessage, waAccount, contact 
     let storedMessage = null;
 
     if (rule.response_type === 'template') {
+      const templateComponents = buildTemplateComponents(rule, context);
       const result = await metaService.sendTemplateMessage(
         waAccount.phone_number_id,
         accessToken,
         contactPhone,
         rule.template_name,
         rule.template_language || 'en',
-        buildTemplateComponents(rule, context)
+        templateComponents
       );
       waMessageId = result.messages?.[0]?.id || null;
+      const bodyValues = templateComponents
+        .filter((item) => String(item?.type || '').toLowerCase() === 'body')
+        .flatMap((item) => item.parameters || [])
+        .map((item) => String(item?.text || '').trim());
       storedMessage = await storeOutboundMessage({
         tenantId,
         phone: contactPhone,
         messageType: 'template',
-        content: `[Template: ${rule.template_name}]`,
+        content: bodyValues.join(' ') || `[Template: ${rule.template_name}]`,
         waMessageId,
         templateName: rule.template_name,
+        templateParams: {
+          components: templateComponents,
+          preview: {
+            body_text: bodyValues.join(' '),
+            template_body_text: '',
+            header_link: templateComponents
+              .filter((item) => String(item?.type || '').toLowerCase() === 'header')
+              .flatMap((item) => item.parameters || [])
+              .map((item) => item?.document?.link || item?.image?.link || item?.video?.link || '')
+              .find(Boolean) || '',
+            header_type: templateComponents
+              .filter((item) => String(item?.type || '').toLowerCase() === 'header')
+              .flatMap((item) => item.parameters || [])
+              .map((item) => item?.type || '')
+              .find(Boolean) || '',
+          },
+        },
       });
     } else {
       const text = interpolateText(rule.text_body, context);

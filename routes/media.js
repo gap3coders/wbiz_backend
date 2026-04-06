@@ -46,14 +46,24 @@ const inferAssetType = (mimeType = '', fileName = '') => {
 };
 
 const parseDataUrl = (value) => {
-  const match = String(value || '').match(/^data:([^;]+);base64,(.+)$/);
+  const raw = String(value || '').trim();
+  const match = raw.match(/^data:([^,]+),(.+)$/);
   if (!match) {
     throw new Error('Upload payload must be a valid base64 data URL');
   }
+  const meta = String(match[1] || '');
+  const payload = String(match[2] || '');
+  if (!/;base64$/i.test(meta)) {
+    throw new Error('Upload payload must include ;base64 marker');
+  }
+  const mimeType = meta.split(';')[0].trim();
+  if (!mimeType) {
+    throw new Error('Upload payload is missing MIME type');
+  }
 
   return {
-    mimeType: match[1],
-    buffer: Buffer.from(match[2], 'base64'),
+    mimeType,
+    buffer: Buffer.from(payload, 'base64'),
   };
 };
 

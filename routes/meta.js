@@ -52,7 +52,7 @@ const ensureContact = async (tenantId, phone, waExists = 'unknown') => {
   return contact;
 };
 
-const storeOutboundMessage = async ({ tenantId, userId, phone, messageType, content, waMessageId, templateName = null, mediaUrl = null, mediaFilename = null }) => {
+const storeOutboundMessage = async ({ tenantId, userId, phone, messageType, content, waMessageId, templateName = null, templateParams = null, mediaUrl = null, mediaFilename = null }) => {
   const contact = await ensureContact(tenantId, phone, waMessageId ? 'yes' : 'unknown');
   return Message.create({
     tenant_id: tenantId,
@@ -62,6 +62,7 @@ const storeOutboundMessage = async ({ tenantId, userId, phone, messageType, cont
     message_type: messageType,
     content,
     template_name: templateName,
+    template_params: templateParams,
     media_url: mediaUrl,
     media_filename: mediaFilename,
     wa_message_id: waMessageId,
@@ -74,14 +75,20 @@ const storeOutboundMessage = async ({ tenantId, userId, phone, messageType, cont
 // Wrap Meta errors with clear source
 const handleError = (res, error, fallback) => {
   if (error.source === 'meta') {
+    const detail =
+      error.metaError?.error_data?.details ||
+      error.metaError?.error_user_msg ||
+      '';
+    const renderedMessage = detail ? `${error.message} | ${detail}` : error.message;
     console.error('[Meta Route][Meta Error]', {
       fallback,
       message: error.message,
+      detail: detail || null,
       code: error.metaError?.code || null,
       subcode: error.metaError?.error_subcode || null,
       type: error.metaError?.type || null,
     });
-    return apiResponse(res, { status: error.statusCode||500, success:false, error: `[Meta API Error] ${error.message}`, error_source:'meta', meta_error: error.metaError });
+    return apiResponse(res, { status: error.statusCode||500, success:false, error: `[Meta API Error] ${renderedMessage}`, error_source:'meta', meta_error: error.metaError });
   }
   console.error('[Meta Route][Platform Error]', {
     fallback,
@@ -432,6 +439,160 @@ router.post('/phone-numbers/deregister', authenticate, requireStatus('active'), 
 // ═══════════════════════════════════════
 // TEMPLATES (Meta = source of truth)
 // ═══════════════════════════════════════
+const parseTemplatePlaceholders = (value = '') => {
+  const found = [];
+  const re = /\{\{(\d+)\}\}/g;
+  let match;
+  while ((match = re.exec(String(value || '')))) {
+    found.push(Number(match[1]));
+  }
+  return Array.from(new Set(found)).sort((a, b) => a - b);
+};
+
+const ensureTemplateVariables = (text = '', label = 'BODY') => {
+  const invalidTokens = String(text || '').match(/\{\{[^}]+\}\}/g) || [];
+  invalidTokens.forEach((token) => {
+    if (!/^\{\{\d+\}\}$/.test(token)) {
+      throw new Error(`${label} supports only numeric placeholders like {{1}}, {{2}}`);
+    }
+  });
+  const indexes = parseTemplatePlaceholders(text);
+  indexes.forEach((value, index) => {
+    if (value !== index + 1) {
+      throw new Error(`${label} placeholders must be sequential: {{1}}, {{2}}, ...`);
+    }
+  });
+};
+
+const ensureTemplateComponents = (components) => {
+  if (!Array.isArray(components) || components.length === 0) {
+    throw new Error('components must be a non-empty array');
+  }
+  const body = components.find((item) => String(item?.type || '').toUpperCase() === 'BODY');
+  if (!body || !String(body.text || '').trim()) throw new Error('BODY component is required');
+  ensureTemplateVariables(body.text, 'BODY');
+
+  const header = components.find((item) => String(item?.type || '').toUpperCase() === 'HEADER');
+  if (header) {
+    const format = String(header.format || 'TEXT').toUpperCase();
+    if (!['TEXT', 'IMAGE', 'VIDEO', 'DOCUMENT'].includes(format)) {
+      throw new Error('HEADER format must be TEXT, IMAGE, VIDEO, or DOCUMENT');
+    }
+    if (format === 'TEXT') {
+      if (!String(header.text || '').trim()) throw new Error('TEXT header requires text');
+      ensureTemplateVariables(header.text, 'HEADER');
+    } else if (!Array.isArray(header.example?.header_handle) || !header.example.header_handle.length) {
+      throw new Error(`${format} header requires example.header_handle`);
+    } else {
+      const firstHandle = String(header.example.header_handle[0] || '').trim();
+      if (/^https?:\/\//i.test(firstHandle)) {
+        throw new Error(`${format} header expects Meta media handle, not public URL`);
+      }
+    }
+  }
+
+  const buttonsComp = components.find((item) => String(item?.type || '').toUpperCase() === 'BUTTONS');
+  if (buttonsComp) {
+    const buttons = Array.isArray(buttonsComp.buttons) ? buttonsComp.buttons : [];
+    if (!buttons.length || buttons.length > 3) throw new Error('BUTTONS supports 1 to 3 buttons');
+    buttons.forEach((button) => {
+      const type = String(button?.type || '').toUpperCase();
+      const text = String(button?.text || '').trim();
+      if (!text) throw new Error('Button text is required');
+      if (!['QUICK_REPLY', 'URL', 'PHONE_NUMBER'].includes(type)) throw new Error(`Unsupported button type: ${type}`);
+      if (type === 'URL' && !String(button?.url || '').trim()) throw new Error('URL button requires url');
+      if (type === 'PHONE_NUMBER' && !String(button?.phone_number || '').trim()) throw new Error('PHONE button requires phone_number');
+    });
+  }
+};
+
+const inferMimeFromFormat = (format = '') => {
+  const normalized = String(format || '').toUpperCase();
+  if (normalized === 'IMAGE') return 'image/jpeg';
+  if (normalized === 'VIDEO') return 'video/mp4';
+  if (normalized === 'DOCUMENT') return 'application/pdf';
+  return 'application/octet-stream';
+};
+
+const normalizeTemplateSampleMimeType = (format = '', upstreamMimeType = '') => {
+  const normalizedFormat = String(format || '').toUpperCase();
+  const mime = String(upstreamMimeType || '').toLowerCase();
+  if (normalizedFormat === 'DOCUMENT') {
+    if (mime.includes('pdf')) return 'application/pdf';
+    return 'application/pdf';
+  }
+  if (normalizedFormat === 'IMAGE') {
+    if (mime.startsWith('image/')) return mime;
+    return 'image/jpeg';
+  }
+  if (normalizedFormat === 'VIDEO') {
+    if (mime.startsWith('video/')) return mime;
+    return 'video/mp4';
+  }
+  return inferMimeFromFormat(normalizedFormat);
+};
+
+const renderTemplateBodyPreview = (bodyTemplate = '', bodyParameters = []) => {
+  let rendered = String(bodyTemplate || '');
+  bodyParameters.forEach((value, index) => {
+    const token = new RegExp(`\\{\\{${index + 1}\\}\\}`, 'g');
+    rendered = rendered.replace(token, String(value || ''));
+  });
+  return rendered.trim();
+};
+
+router.post('/templates/media-handle', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const mediaUrl = String(req.body?.media_url || '').trim();
+    const format = String(req.body?.format || '').toUpperCase();
+    if (!mediaUrl) {
+      return apiResponse(res, { status: 400, success: false, error: '[Platform] media_url is required', error_source: 'platform' });
+    }
+    if (!['IMAGE', 'VIDEO', 'DOCUMENT'].includes(format)) {
+      return apiResponse(res, { status: 400, success: false, error: '[Platform] format must be IMAGE, VIDEO, or DOCUMENT', error_source: 'platform' });
+    }
+
+    const { token } = await getWA(req.tenant._id);
+    const response = await fetch(mediaUrl);
+    if (!response.ok) {
+      return apiResponse(res, { status: 400, success: false, error: `[Platform] Could not fetch media URL (${response.status})`, error_source: 'platform' });
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const upstreamType = String(response.headers.get('content-type') || '').split(';')[0].trim();
+    const contentType = normalizeTemplateSampleMimeType(format, upstreamType);
+    if (format === 'DOCUMENT') {
+      const lowerUrl = mediaUrl.toLowerCase();
+      const looksLikePdf = lowerUrl.endsWith('.pdf') || contentType === 'application/pdf';
+      if (!looksLikePdf) {
+        return apiResponse(res, {
+          status: 400,
+          success: false,
+          error: '[Platform] DOCUMENT template requires a PDF file URL',
+          error_source: 'platform',
+        });
+      }
+    }
+    const defaultName =
+      format === 'IMAGE' ? 'template-image.jpg' :
+      format === 'VIDEO' ? 'template-video.mp4' :
+      'template-document.pdf';
+    const uploaded = await metaService.uploadTemplateSampleHandle(
+      token,
+      buffer,
+      contentType,
+      defaultName
+    );
+    const handle = String(uploaded?.handle || '').trim();
+    if (!handle) {
+      return apiResponse(res, { status: 500, success: false, error: '[Platform] Meta did not return media handle', error_source: 'platform' });
+    }
+    return apiResponse(res, { data: { handle, mime_type: contentType } });
+  } catch (error) {
+    return handleError(res, error, 'Template media handle generation failed');
+  }
+});
+
 router.get('/templates', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const { wa, token } = await getWA(req.tenant._id);
@@ -452,6 +613,7 @@ router.post('/templates', authenticate, requireStatus('active'), async (req, res
   try {
     const { name, category, language, components, allow_category_change } = req.body;
     if (!name||!category||!components) return apiResponse(res, { status:400, success:false, error:'[Platform] name, category, components required', error_source:'platform' });
+    ensureTemplateComponents(components);
     const { wa, token } = await getWA(req.tenant._id);
     const result = await metaService.createTemplate(wa.waba_id, token, { name, category, language:language||'en', components, allow_category_change:allow_category_change!==false });
     await Notification.create({ tenant_id:req.tenant._id, type:'template_pending', title:'Template Submitted', message:`Template "${name}" submitted to Meta for approval.`, source:'meta', severity:'info', link:'/portal/templates' });
@@ -509,23 +671,110 @@ router.post('/messages/send', authenticate, requireStatus('active'), async (req,
 
 router.post('/messages/send-template', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const { to, template_name, language, components } = req.body;
+    const { to, template_name, language, components, header_media_url, header_type, body_parameters } = req.body;
     if (!to||!template_name) return apiResponse(res, { status:400, success:false, error:'[Platform] to and template_name required', error_source:'platform' });
     const { wa, token } = await getWA(req.tenant._id);
     const normalizedTo = to.replace(/[^0-9]/g,'');
+    let resolvedComponents = Array.isArray(components) ? components : [];
+
+    if (!resolvedComponents.length && header_media_url) {
+      const normalizedHeaderType = String(header_type || 'document').toLowerCase();
+      if (!['image', 'video', 'document'].includes(normalizedHeaderType)) {
+        return apiResponse(res, {
+          status: 400,
+          success: false,
+          error: '[Platform] header_type must be image, video, or document when header_media_url is provided',
+          error_source: 'platform',
+        });
+      }
+      resolvedComponents = [
+        {
+          type: 'header',
+          parameters: [
+            {
+              type: normalizedHeaderType,
+              [normalizedHeaderType]: { link: String(header_media_url).trim() },
+            },
+          ],
+        },
+      ];
+    }
+
+    if (Array.isArray(body_parameters) && body_parameters.length) {
+      const bodyTexts = body_parameters
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+        .map((text) => ({ type: 'text', text }));
+      if (bodyTexts.length) {
+        const existingBodyIndex = resolvedComponents.findIndex((item) => String(item?.type || '').toLowerCase() === 'body');
+        if (existingBodyIndex >= 0) {
+          resolvedComponents[existingBodyIndex] = { type: 'body', parameters: bodyTexts };
+        } else {
+          resolvedComponents.push({ type: 'body', parameters: bodyTexts });
+        }
+      }
+    }
+
+    const templates = await metaService.getTemplates(wa.waba_id, token);
+    const matching = templates.find((tpl) => String(tpl.name || '') === String(template_name || ''));
+
+    if (!resolvedComponents.length) {
+      const expectedHeader = matching?.components?.find((item) => String(item?.type || '').toUpperCase() === 'HEADER');
+      const expectedFormat = String(expectedHeader?.format || '').toUpperCase();
+      if (['DOCUMENT', 'IMAGE', 'VIDEO'].includes(expectedFormat)) {
+        return apiResponse(res, {
+          status: 400,
+          success: false,
+          error: `[Platform] Template "${template_name}" requires header ${expectedFormat}. Provide header_media_url and header_type in request.`,
+          error_source: 'platform',
+        });
+      }
+    }
+
+    const resolvedBodyParameters = resolvedComponents
+      .filter((item) => String(item?.type || '').toLowerCase() === 'body')
+      .flatMap((item) => item.parameters || [])
+      .map((item) => String(item?.text || '').trim());
+    const templateBodyText = String(
+      matching?.components?.find((item) => String(item?.type || '').toUpperCase() === 'BODY')?.text || ''
+    );
+    const renderedBodyText = renderTemplateBodyPreview(templateBodyText, resolvedBodyParameters);
+    const headerMediaParam = resolvedComponents
+      .filter((item) => String(item?.type || '').toLowerCase() === 'header')
+      .flatMap((item) => item.parameters || [])
+      .find((param) => param?.document?.link || param?.image?.link || param?.video?.link);
+    const headerMediaLink = headerMediaParam?.document?.link || headerMediaParam?.image?.link || headerMediaParam?.video?.link || '';
+
     if (verboseLogs) {
       console.info('[Platform Send][Template][Request]', {
         tenant_id: String(req.tenant._id),
         to: normalizedTo,
         template_name,
         language: language || 'en',
-        components_count: Array.isArray(components) ? components.length : 0,
+        components_count: Array.isArray(resolvedComponents) ? resolvedComponents.length : 0,
         phone_number_id: wa.phone_number_id,
       });
     }
-    const result = await metaService.sendTemplateMessage(wa.phone_number_id, token, normalizedTo, template_name, language||'en', components||[]);
+    const result = await metaService.sendTemplateMessage(wa.phone_number_id, token, normalizedTo, template_name, language||'en', resolvedComponents||[]);
     const waMessageId = result.messages?.[0]?.id || null;
-    await storeOutboundMessage({ tenantId: req.tenant._id, userId: req.user._id, phone: normalizedTo, messageType: 'template', content: `[Template: ${template_name}]`, waMessageId, templateName: template_name });
+    await storeOutboundMessage({
+      tenantId: req.tenant._id,
+      userId: req.user._id,
+      phone: normalizedTo,
+      messageType: 'template',
+      content: renderedBodyText || `[Template: ${template_name}]`,
+      waMessageId,
+      templateName: template_name,
+      templateParams: {
+        components: resolvedComponents || [],
+        preview: {
+          body_text: renderedBodyText || '',
+          template_body_text: templateBodyText || '',
+          header_link: headerMediaLink || '',
+          header_type: headerMediaParam?.type || '',
+        },
+      },
+    });
     if (verboseLogs) {
       console.info('[Meta Send][Template][Accepted]', {
         tenant_id: String(req.tenant._id),

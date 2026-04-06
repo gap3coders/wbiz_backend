@@ -70,6 +70,8 @@ router.get('/', authenticate, requireStatus('active'), async (req, res) => {
 
     if (search) {
       const regex = { $regex: escapeRegex(search), $options: 'i' };
+      const digits = String(search).replace(/[^\d]/g, '');
+      const digitRegex = digits ? { $regex: escapeRegex(digits), $options: 'i' } : null;
       filter.$or = [
         { name: regex },
         { wa_name: regex },
@@ -77,6 +79,7 @@ router.get('/', authenticate, requireStatus('active'), async (req, res) => {
         { phone: regex },
         { whatsapp_id: regex },
         { email: regex },
+        ...(digitRegex ? [{ phone: digitRegex }, { phone_number: digitRegex }, { country_code: digitRegex }] : []),
       ];
     }
 

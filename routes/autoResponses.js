@@ -39,6 +39,8 @@ const sanitizeRulePayload = (body = {}, userId = null, isUpdate = false) => {
   if (!isUpdate || body.text_body !== undefined) payload.text_body = String(body.text_body || '');
   if (!isUpdate || body.template_name !== undefined) payload.template_name = String(body.template_name || '').trim();
   if (!isUpdate || body.template_language !== undefined) payload.template_language = String(body.template_language || 'en').trim() || 'en';
+  if (!isUpdate || body.template_header_type !== undefined) payload.template_header_type = String(body.template_header_type || 'none').trim().toLowerCase() || 'none';
+  if (!isUpdate || body.template_header_media_url !== undefined) payload.template_header_media_url = String(body.template_header_media_url || '').trim();
   if (!isUpdate || body.template_variables !== undefined) payload.template_variables = normalizeTemplateVariables(body.template_variables);
   if (!isUpdate || body.send_once_per_contact !== undefined) payload.send_once_per_contact = Boolean(body.send_once_per_contact);
   if (!isUpdate || body.cooldown_minutes !== undefined) payload.cooldown_minutes = Math.max(0, Number.parseInt(body.cooldown_minutes, 10) || 0);
@@ -72,6 +74,9 @@ const validateRulePayload = (payload) => {
   if (payload.trigger_type === 'keyword' && !payload.keywords?.length) return 'At least one keyword is required for keyword rules';
   if (payload.response_type === 'text' && !String(payload.text_body || '').trim()) return 'Text reply is required for text responses';
   if (payload.response_type === 'template' && !String(payload.template_name || '').trim()) return 'Template name is required for template responses';
+  if (payload.response_type === 'template' && ['image', 'video', 'document'].includes(String(payload.template_header_type || '').toLowerCase()) && !String(payload.template_header_media_url || '').trim()) {
+    return 'Template header media URL is required for media header templates';
+  }
   return null;
 };
 

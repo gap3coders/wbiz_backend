@@ -192,6 +192,32 @@ const uploadMedia = async (phoneId, t, fileBuffer, mimeType, filename) => {
   return data;
 };
 
+const uploadTemplateSampleHandle = async (t, fileBuffer, mimeType, filename) => {
+  const safeFilename = String(filename || 'sample').replace(/[^\w.\-]+/g, '_');
+  const fileLength = Number(fileBuffer?.length || 0);
+  if (!fileLength) throw new Error('Empty file payload');
+
+  const createSessionUrl = `${graphApiBase}/${appId}/uploads?file_name=${encodeURIComponent(safeFilename)}&file_length=${fileLength}&file_type=${encodeURIComponent(mimeType)}&access_token=${encodeURIComponent(t)}`;
+  const session = await fetchJson(createSessionUrl, { method: 'POST' });
+  const sessionId = String(session?.id || '').trim();
+  if (!sessionId) throw new Error('Meta upload session not created');
+
+  const uploadResponse = await fetch(`${graphApiBase}/${sessionId}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `OAuth ${t}`,
+      file_offset: '0',
+      'Content-Type': mimeType,
+    },
+    body: fileBuffer,
+  });
+  const uploadData = await uploadResponse.json();
+  if (uploadData.error) throw new MetaApiError(uploadData.error.message, uploadData.error, uploadResponse.status);
+  const handle = String(uploadData?.h || uploadData?.handle || '').trim();
+  if (!handle) throw new Error('Meta did not return upload handle');
+  return { handle, session_id: sessionId };
+};
+
 const markMessageRead = async (phoneId, t, msgId) => fetchJson(`${graphApiBase}/${phoneId}/messages`, { method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${t}`}, body:JSON.stringify({messaging_product:'whatsapp',status:'read',message_id:msgId}) });
 
 // ═══ CONTACT VERIFICATION ═══
@@ -220,6 +246,6 @@ module.exports = {
   subscribeWebhook, getAppSubscriptions, getWabaSubscribedApps, getAccountHealth, getBusinessProfile, updateBusinessProfile,
   fetchWABABillingInfo, fetchExtendedCredits,
   getTemplates, createTemplate, editTemplate, deleteTemplate,
-  sendTextMessage, sendTemplateMessage, sendMediaMessage, uploadMedia, markMessageRead, getMediaDetails, getMediaUrl,
+  sendTextMessage, sendTemplateMessage, sendMediaMessage, uploadMedia, uploadTemplateSampleHandle, markMessageRead, getMediaDetails, getMediaUrl,
   getConversationAnalytics,
 };

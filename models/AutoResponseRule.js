@@ -50,6 +50,8 @@ const autoResponseRuleSchema = new mongoose.Schema(
     text_body: { type: String, default: '' },
     template_name: { type: String, default: '', trim: true },
     template_language: { type: String, default: 'en', trim: true },
+    template_header_type: { type: String, enum: ['none', 'image', 'video', 'document'], default: 'none' },
+    template_header_media_url: { type: String, default: '', trim: true },
     template_variables: { type: [templateVariableSchema], default: [] },
     business_hours: { type: businessHoursSchema, default: () => ({}) },
     send_once_per_contact: { type: Boolean, default: false },
@@ -67,6 +69,8 @@ autoResponseRuleSchema.pre('save', function normalizeRule(next) {
   this.description = String(this.description || '').trim();
   this.template_name = String(this.template_name || '').trim();
   this.template_language = String(this.template_language || 'en').trim() || 'en';
+  this.template_header_type = String(this.template_header_type || 'none').trim().toLowerCase() || 'none';
+  this.template_header_media_url = String(this.template_header_media_url || '').trim();
   this.text_body = String(this.text_body || '');
   this.priority = Number.isFinite(Number(this.priority)) ? Number(this.priority) : 100;
   this.cooldown_minutes = Number.isFinite(Number(this.cooldown_minutes)) ? Number(this.cooldown_minutes) : 0;

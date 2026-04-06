@@ -18,6 +18,15 @@ const safeEmail = (value) => {
   return normalized || 'N/A';
 };
 
+const renderTemplateBodyPreview = (bodyTemplate = '', bodyParameters = []) => {
+  let rendered = String(bodyTemplate || '');
+  bodyParameters.forEach((value, index) => {
+    const token = new RegExp(`\\{\\{${index + 1}\\}\\}`, 'g');
+    rendered = rendered.replace(token, String(value || ''));
+  });
+  return rendered.trim();
+};
+
 const resolveRecipients = async ({ tenantId, targetType, targetTags, recipients }) => {
   if (targetType === 'all') {
     const contacts = await Contact.find({ tenant_id: tenantId, opt_in: true }).select('phone');
@@ -155,9 +164,37 @@ const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
           contact_phone: phone,
           direction: 'outbound',
           message_type: 'template',
-          content: `[Campaign: ${campaign.name}]`,
+          content: renderTemplateBodyPreview(
+            String(campaign.template_components?.find((item) => String(item?.type || '').toLowerCase() === 'body')?.text || ''),
+            comps
+              .filter((item) => String(item?.type || '').toLowerCase() === 'body')
+              .flatMap((item) => item.parameters || [])
+              .map((item) => String(item?.text || '').trim())
+          ) || `[Campaign: ${campaign.name}]`,
           template_name: campaign.template_name,
-          template_params: { components: comps },
+          template_params: {
+            components: comps,
+            preview: {
+              body_text: renderTemplateBodyPreview(
+                String(campaign.template_components?.find((item) => String(item?.type || '').toLowerCase() === 'body')?.text || ''),
+                comps
+                  .filter((item) => String(item?.type || '').toLowerCase() === 'body')
+                  .flatMap((item) => item.parameters || [])
+                  .map((item) => String(item?.text || '').trim())
+              ),
+              template_body_text: String(campaign.template_components?.find((item) => String(item?.type || '').toLowerCase() === 'body')?.text || ''),
+              header_link: comps
+                .filter((item) => String(item?.type || '').toLowerCase() === 'header')
+                .flatMap((item) => item.parameters || [])
+                .map((param) => param?.document?.link || param?.image?.link || param?.video?.link || '')
+                .find(Boolean) || '',
+              header_type: comps
+                .filter((item) => String(item?.type || '').toLowerCase() === 'header')
+                .flatMap((item) => item.parameters || [])
+                .map((param) => param?.type || '')
+                .find(Boolean) || '',
+            },
+          },
           wa_message_id: result.messages?.[0]?.id,
           status: 'sent',
           campaign_id: campaign._id,
