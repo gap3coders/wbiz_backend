@@ -81,9 +81,11 @@ const splitCombinedPhone = (phone = '', fallbackCountryCode = '91') => {
 };
 
 const parsePhoneInput = ({ phone = '', country_code = '', phone_number = '', default_country_code = '91' } = {}) => {
+  const rawPhone = String(phone || '').trim();
   const directCountryCode = normalizeCountryCode(country_code);
   const directPhoneNumber = normalizeNationalNumber(phone_number);
   const combined = digitsOnly(phone);
+  const hasExplicitIntlPrefix = rawPhone.startsWith('+') || rawPhone.startsWith('00');
 
   let nextCountryCode = directCountryCode;
   let nextPhoneNumber = directPhoneNumber;
@@ -92,10 +94,24 @@ const parsePhoneInput = ({ phone = '', country_code = '', phone_number = '', def
   if (nextCountryCode && nextPhoneNumber) {
     nextPhone = `${nextCountryCode}${nextPhoneNumber}`;
   } else if (combined) {
-    const split = splitCombinedPhone(combined, default_country_code);
-    nextCountryCode = nextCountryCode || split.country_code;
-    nextPhoneNumber = nextPhoneNumber || split.phone_number;
-    nextPhone = split.phone;
+    const fallbackCountryCode = normalizeCountryCode(default_country_code);
+    if (!directCountryCode && !directPhoneNumber && !hasExplicitIntlPrefix && fallbackCountryCode) {
+      const alreadyWithFallback = combined.startsWith(fallbackCountryCode) && combined.length > fallbackCountryCode.length + 5;
+      if (alreadyWithFallback) {
+        nextCountryCode = fallbackCountryCode;
+        nextPhoneNumber = combined.slice(fallbackCountryCode.length);
+        nextPhone = combined;
+      } else {
+        nextCountryCode = fallbackCountryCode;
+        nextPhoneNumber = combined;
+        nextPhone = `${fallbackCountryCode}${combined}`;
+      }
+    } else {
+      const split = splitCombinedPhone(combined, default_country_code);
+      nextCountryCode = nextCountryCode || split.country_code;
+      nextPhoneNumber = nextPhoneNumber || split.phone_number;
+      nextPhone = split.phone;
+    }
   } else if (nextCountryCode || nextPhoneNumber) {
     nextPhone = `${nextCountryCode}${nextPhoneNumber}`;
   }
