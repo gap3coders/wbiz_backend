@@ -57,6 +57,12 @@ const resolveVariable = (mapping, contact, fallbackText) => {
 const normalizeTemplateComponents = (campaign, contact) => {
   const baseComponents = Array.isArray(campaign.template_components) ? campaign.template_components : [];
   const variableMapping = campaign.variable_mapping || {};
+  const headerMediaMode = String(variableMapping.__header_media_mode || 'global').toLowerCase();
+  const headerMediaType = String(variableMapping.__header_media_type || '').toLowerCase();
+  const headerMediaGlobal = String(variableMapping.__header_media_global || '').trim();
+  const headerMediaByContact = variableMapping.__header_media_by_contact && typeof variableMapping.__header_media_by_contact === 'object'
+    ? variableMapping.__header_media_by_contact
+    : {};
   if (!Object.keys(variableMapping).length) return baseComponents;
 
   const result = baseComponents.filter((component) => !['body', 'header'].includes(String(component.type || '').toLowerCase()));
@@ -80,6 +86,16 @@ const normalizeTemplateComponents = (campaign, contact) => {
       const key = `${slot}_${index}`;
       const mapping = variableMapping[key];
       const baseParameter = baseParameters[index - 1] || {};
+      if (slot === 'header' && ['image', 'video', 'document'].includes(String(baseParameter.type || '').toLowerCase())) {
+        const mappedUrl = headerMediaMode === 'individual'
+          ? String(headerMediaByContact?.[contact?.phone] || '').trim()
+          : '';
+        const resolvedUrl = mappedUrl || headerMediaGlobal || String(baseParameter?.[String(baseParameter.type || '').toLowerCase()]?.link || '').trim();
+        const resolvedType = String(baseParameter.type || headerMediaType || '').toLowerCase();
+        if (resolvedType && resolvedUrl) {
+          return { type: resolvedType, [resolvedType]: { link: resolvedUrl } };
+        }
+      }
       const hasMapping = Object.prototype.hasOwnProperty.call(variableMapping, key);
       if (!hasMapping && baseParameter.type && baseParameter.type !== 'text') {
         return baseParameter;
