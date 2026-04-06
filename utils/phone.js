@@ -1,4 +1,25 @@
-const digitsOnly = (value = '') => String(value || '').replace(/[^\d]/g, '');
+const expandScientificNotation = (value = '') => {
+  const raw = String(value || '').trim();
+  if (!/[eE]/.test(raw)) return raw;
+  const match = raw.match(/^([+-]?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/);
+  if (!match) return raw;
+  const sign = match[1] || '';
+  const intPart = match[2] || '';
+  const fracPart = match[3] || '';
+  const exponent = Number.parseInt(match[4], 10);
+  if (!Number.isFinite(exponent)) return raw;
+  const digits = `${intPart}${fracPart}`;
+  const decimalPosition = intPart.length + exponent;
+  if (decimalPosition <= 0) {
+    return `${sign}0.${'0'.repeat(Math.abs(decimalPosition))}${digits}`;
+  }
+  if (decimalPosition >= digits.length) {
+    return `${sign}${digits}${'0'.repeat(decimalPosition - digits.length)}`;
+  }
+  return `${sign}${digits.slice(0, decimalPosition)}.${digits.slice(decimalPosition)}`;
+};
+
+const digitsOnly = (value = '') => expandScientificNotation(value).replace(/[^\d]/g, '');
 
 const COUNTRY_CODE_LIST = [
   '1', '7', '20', '27', '30', '31', '32', '33', '34', '36', '39', '40', '41', '43', '44', '45', '46', '47', '48', '49',

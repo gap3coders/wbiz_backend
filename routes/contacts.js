@@ -262,6 +262,81 @@ router.post('/maintenance/normalize-phones', authenticate, requireStatus('active
   }
 });
 
+router.post('/maintenance/bulk-country-code', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const phones = Array.isArray(req.body?.phones)
+      ? req.body.phones.map((item) => String(item || '').replace(/[^\d]/g, '')).filter(Boolean)
+      : [];
+    const defaultCountryCode = String(req.body?.default_country_code || process.env.DEFAULT_COUNTRY_CODE || '91');
+    const overrides = req.body?.overrides && typeof req.body.overrides === 'object' ? req.body.overrides : {};
+
+    if (!phones.length) {
+      return apiResponse(res, { status: 400, success: false, error: '[Platform] phones array required' });
+    }
+
+    const contacts = await Contact.find({ tenant_id: req.tenant._id, phone: { $in: phones } });
+    let updated = 0;
+    let skipped = 0;
+    const results = [];
+
+    for (const contact of contacts) {
+      const phone = String(contact.phone || '').replace(/[^\d]/g, '');
+      const overrideCountryCode = String(overrides?.[phone] || '').replace(/[^\d]/g, '');
+      const desiredCountryCode = overrideCountryCode || defaultCountryCode;
+      const parsed = parsePhoneInput({
+        phone: contact.phone || contact.whatsapp_id,
+        country_code: desiredCountryCode,
+        phone_number: contact.phone_number,
+        default_country_code: desiredCountryCode,
+      });
+
+      if (!parsed.ok) {
+        skipped += 1;
+        results.push({ phone, status: 'skipped', reason: parsed.error });
+        continue;
+      }
+
+      const changed =
+        String(contact.phone || '') !== parsed.phone ||
+        String(contact.country_code || '') !== parsed.country_code ||
+        String(contact.phone_number || '') !== parsed.phone_number ||
+        String(contact.whatsapp_id || '') !== parsed.phone;
+
+      if (!changed) {
+        results.push({ phone, status: 'unchanged', reason: null });
+        continue;
+      }
+
+      contact.phone = parsed.phone;
+      contact.country_code = parsed.country_code;
+      contact.phone_number = parsed.phone_number;
+      contact.whatsapp_id = parsed.phone;
+      await contact.save();
+      updated += 1;
+      results.push({ phone: parsed.phone, status: 'updated', reason: null });
+    }
+
+    return apiResponse(res, {
+      data: {
+        updated,
+        skipped,
+        scanned: contacts.length,
+        results,
+      },
+    });
+  } catch (error) {
+    console.error('[Contacts Route][Bulk Country Code Failed]', {
+      tenant_id: String(req.tenant?._id || ''),
+      error: error.message,
+    });
+    return apiResponse(res, {
+      status: 500,
+      success: false,
+      error: '[Platform] Failed to apply bulk country code',
+    });
+  }
+});
+
 router.post('/', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const { phone, country_code, phone_number, name, email, labels, notes, custom_fields } = req.body || {};

@@ -1,4 +1,6 @@
 const express = require('express');
+const fs = require('fs/promises');
+const path = require('path');
 const { authenticate, requireStatus } = require('../middleware/auth');
 const metaService = require('../services/metaService');
 const { encrypt, decrypt } = require('../services/encryptionService');
@@ -7,8 +9,16 @@ const Contact = require('../models/Contact');
 const Message = require('../models/Message');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
+const Conversation = require('../models/Conversation');
+const Campaign = require('../models/Campaign');
+const MediaAsset = require('../models/MediaAsset');
+const WebhookEvent = require('../models/WebhookEvent');
+const AuditLog = require('../models/AuditLog');
+const AutoResponseRule = require('../models/AutoResponseRule');
+const AutoResponseLog = require('../models/AutoResponseLog');
 const { apiResponse } = require('../utils/helpers');
 const router = express.Router();
+const STORAGE_ROOT = path.join(__dirname, '..', 'storage');
 
 const pendingTokens = new Map();
 const verboseLogs =
@@ -257,6 +267,54 @@ router.post('/reconnect', authenticate, requireStatus('active'), async (req, res
     await User.findByIdAndUpdate(req.user._id, { status:'pending_setup' });
     return apiResponse(res, { data: { message:'Disconnected. Reconnect now.', redirect_to:'/portal/setup' } });
   } catch(e) { return handleError(res, e, 'Reconnect failed'); }
+});
+
+router.post('/maintenance/clear-tenant-data', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const confirmText = String(req.body?.confirm_text || '').trim().toUpperCase();
+    if (confirmText !== 'CLEAR') {
+      return apiResponse(res, { status: 400, success: false, error: '[Platform] confirm_text must be CLEAR', error_source: 'platform' });
+    }
+    const tenantId = req.tenant._id;
+    const mediaAssets = await MediaAsset.find({ tenant_id: tenantId }).select('relative_path').lean();
+    for (const asset of mediaAssets) {
+      const relativePath = String(asset.relative_path || '').trim();
+      if (!relativePath) continue;
+      await fs.unlink(path.join(STORAGE_ROOT, relativePath)).catch(() => null);
+    }
+    await fs.rm(path.join(STORAGE_ROOT, 'media', String(tenantId)), { recursive: true, force: true }).catch(() => null);
+
+    const [contacts, conversations, messages, campaigns, notifications, webhookEvents, auditLogs, autoResponseRules, autoResponseLogs, media] = await Promise.all([
+      Contact.deleteMany({ tenant_id: tenantId }),
+      Conversation.deleteMany({ tenant_id: tenantId }),
+      Message.deleteMany({ tenant_id: tenantId }),
+      Campaign.deleteMany({ tenant_id: tenantId }),
+      Notification.deleteMany({ tenant_id: tenantId }),
+      WebhookEvent.deleteMany({ tenant_id: tenantId }),
+      AuditLog.deleteMany({ tenant_id: tenantId }),
+      AutoResponseRule.deleteMany({ tenant_id: tenantId }),
+      AutoResponseLog.deleteMany({ tenant_id: tenantId }),
+      MediaAsset.deleteMany({ tenant_id: tenantId }),
+    ]);
+
+    return apiResponse(res, {
+      data: {
+        contacts: contacts.deletedCount || 0,
+        conversations: conversations.deletedCount || 0,
+        messages: messages.deletedCount || 0,
+        campaigns: campaigns.deletedCount || 0,
+        notifications: notifications.deletedCount || 0,
+        webhook_events: webhookEvents.deletedCount || 0,
+        audit_logs: auditLogs.deletedCount || 0,
+        auto_response_rules: autoResponseRules.deletedCount || 0,
+        auto_response_logs: autoResponseLogs.deletedCount || 0,
+        media_assets: media.deletedCount || 0,
+        note: 'WhatsApp account connection and users are preserved.',
+      },
+    });
+  } catch (e) {
+    return handleError(res, e, 'Tenant data cleanup failed');
+  }
 });
 
 // ═══════════════════════════════════════
