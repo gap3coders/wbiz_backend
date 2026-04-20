@@ -140,6 +140,7 @@ const summarizeStatus = (checks = []) => {
 
 const buildOverviewMetrics = async (tenantId) => {
   const today = startOfToday();
+  const pendingCutoff = new Date(Date.now() - 5 * 60 * 1000);
 
   const [
     totalMessages,
@@ -152,6 +153,7 @@ const buildOverviewMetrics = async (tenantId) => {
     waVerified,
     waNotAvailable,
     openConversations,
+    pendingDeliveryUpdates,
   ] = await Promise.all([
     Message.countDocuments({ tenant_id: tenantId }),
     Message.countDocuments({ tenant_id: tenantId, direction: 'outbound', timestamp: { $gte: today } }),
@@ -173,6 +175,12 @@ const buildOverviewMetrics = async (tenantId) => {
       { $group: { _id: '$contact_phone' } },
       { $count: 'count' },
     ]),
+    Message.countDocuments({
+      tenant_id: tenantId,
+      direction: 'outbound',
+      status: { $in: ['queued', 'sent'] },
+      timestamp: { $gte: today, $lte: pendingCutoff },
+    }),
   ]);
 
   return {
@@ -186,9 +194,35 @@ const buildOverviewMetrics = async (tenantId) => {
     total_contacts: totalContacts,
     active_campaigns: activeCampaigns,
     open_conversations: openConversations[0]?.count || 0,
+    pending_delivery_updates: pendingDeliveryUpdates,
     wa_verified: waVerified,
     wa_not_available: waNotAvailable,
   };
+};
+
+const buildRecentCampaigns = async (tenantId, limit = 3) => {
+  const campaigns = await Campaign.find({ tenant_id: tenantId })
+    .sort({ created_at: -1 })
+    .limit(Math.max(1, Math.min(limit, 6)))
+    .lean();
+
+  return campaigns.map((campaign) => ({
+    _id: campaign._id,
+    name: campaign.name,
+    status: campaign.status,
+    template_name: campaign.template_name,
+    stats: {
+      total: campaign.stats?.total || 0,
+      sent: campaign.stats?.sent || 0,
+      delivered: campaign.stats?.delivered || 0,
+      read: campaign.stats?.read || 0,
+      failed: campaign.stats?.failed || 0,
+    },
+    created_at: campaign.created_at,
+    updated_at: campaign.updated_at,
+    started_at: campaign.started_at,
+    completed_at: campaign.completed_at,
+  }));
 };
 
 const buildRecentNotifications = async (tenantId, limit = 5) => {
@@ -229,7 +263,8 @@ const buildUnreadConversations = async (tenantId, limit = 5) => {
 };
 
 const buildWabaReadiness = async (tenantId) => {
-  const waAccount = await WhatsAppAccount.findOne({ tenant_id: tenantId }).lean();
+  const waAccount = (await WhatsAppAccount.findOne({ tenant_id: tenantId, is_default: true }).lean())
+    || (await WhatsAppAccount.findOne({ tenant_id: tenantId }).lean());
   const checkedAt = new Date().toISOString();
 
   if (!waAccount) {
@@ -489,11 +524,12 @@ const buildWabaReadiness = async (tenantId) => {
 router.get('/dashboard', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const tenantId = req.tenant._id;
-    const [overview, readiness, notifications, unreadConversations] = await Promise.all([
+    const [overview, readiness, notifications, unreadConversations, recentCampaigns] = await Promise.all([
       buildOverviewMetrics(tenantId),
       buildWabaReadiness(tenantId),
       buildRecentNotifications(tenantId, 5),
       buildUnreadConversations(tenantId, 6),
+      buildRecentCampaigns(tenantId, 3),
     ]);
 
     return apiResponse(res, {
@@ -502,6 +538,7 @@ router.get('/dashboard', authenticate, requireStatus('active'), async (req, res)
         readiness,
         notifications,
         unread_conversations: unreadConversations,
+        recent_campaigns: recentCampaigns,
       },
     });
   } catch (error) {
@@ -579,6 +616,83 @@ router.get('/campaigns', authenticate, requireStatus('active'), async (req, res)
     return apiResponse(res, { data: { campaigns } });
   } catch (error) {
     return apiResponse(res, { status: 500, success: false, error: 'Failed' });
+  }
+});
+
+/* ────────────────────────────────────────────────────────
+   GET /subscriptions — Subscription analytics
+   ──────────────────────────────────────────────────────── */
+router.get('/subscriptions', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const tenantId = req.tenant._id;
+
+    // Total counts
+    const [totalContacts, subscribed, unsubscribed] = await Promise.all([
+      Contact.countDocuments({ tenant_id: tenantId }),
+      Contact.countDocuments({ tenant_id: tenantId, opt_in: { $ne: false } }),
+      Contact.countDocuments({ tenant_id: tenantId, opt_in: false }),
+    ]);
+
+    // Recent unsubscribes (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const recentUnsubscribes = await Contact.find({
+      tenant_id: tenantId,
+      opt_in: false,
+      unsubscribed_at: { $gte: thirtyDaysAgo },
+    })
+      .select({ phone: 1, name: 1, wa_name: 1, unsubscribed_at: 1, unsubscribe_reason: 1 })
+      .sort({ unsubscribed_at: -1 })
+      .limit(50)
+      .lean();
+
+    // Unsubscribe rate over time (by week for last 12 weeks)
+    const twelveWeeksAgo = new Date();
+    twelveWeeksAgo.setDate(twelveWeeksAgo.getDate() - 84);
+
+    const weeklyUnsubs = await Contact.aggregate([
+      { $match: { tenant_id: tenantId, opt_in: false, unsubscribed_at: { $gte: twelveWeeksAgo } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%U', date: '$unsubscribed_at' } },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    // Recent resubscribes (last 30 days)
+    const recentResubscribes = await Contact.countDocuments({
+      tenant_id: tenantId,
+      opt_in: true,
+      subscribed_at: { $gte: thirtyDaysAgo },
+    });
+
+    // Top unsubscribe reasons
+    const topReasons = await Contact.aggregate([
+      { $match: { tenant_id: tenantId, opt_in: false, unsubscribe_reason: { $ne: '' } } },
+      { $group: { _id: '$unsubscribe_reason', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+    ]);
+
+    return apiResponse(res, {
+      data: {
+        total_contacts: totalContacts,
+        subscribed,
+        unsubscribed,
+        subscription_rate: totalContacts > 0 ? ((subscribed / totalContacts) * 100).toFixed(1) : '100.0',
+        unsubscribe_rate: totalContacts > 0 ? ((unsubscribed / totalContacts) * 100).toFixed(1) : '0.0',
+        recent_unsubscribes: recentUnsubscribes,
+        recent_resubscribes_count: recentResubscribes,
+        weekly_unsubscribes: weeklyUnsubs,
+        top_reasons: topReasons,
+      },
+    });
+  } catch (error) {
+    console.error('[Analytics] Subscriptions error:', error);
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to load subscription analytics' });
   }
 });
 

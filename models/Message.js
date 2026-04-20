@@ -45,9 +45,15 @@ const messageSchema = new mongoose.Schema(
     status: { type: String, enum: ['queued', 'sent', 'delivered', 'read', 'failed'], default: 'queued' },
     error_message: { type: String, default: null },
     error_source: { type: String, enum: ['meta', 'platform', null], default: null },
+    interactive_payload: { type: mongoose.Schema.Types.Mixed, default: null },
+    message_source: { type: String, enum: ['manual', 'campaign', 'auto_response', 'date_trigger', 'interactive', 'flow', null], default: null },
     campaign_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', default: null },
     sent_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     timestamp: { type: Date, default: Date.now },
+    deleted_at: {
+      type: Date,
+      default: null,
+    },
   },
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } }
 );

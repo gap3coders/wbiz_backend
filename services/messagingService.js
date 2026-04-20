@@ -36,8 +36,14 @@ const previewFromPayload = (type, payload = {}) => {
       return payload.location?.name || payload.location?.address || 'Location shared';
     case 'template':
       return payload.template?.name ? `Template: ${payload.template.name}` : 'Template message';
-    case 'interactive':
-      return payload.interactive?.body?.text || 'Interactive message';
+    case 'interactive': {
+      const ir = payload.interactive || {};
+      // Inbound replies: button_reply / list_reply
+      if (ir.type === 'button_reply') return ir.button_reply?.title || 'Button reply';
+      if (ir.type === 'list_reply') return ir.list_reply?.title || 'List reply';
+      // Outbound interactive: extract body text
+      return ir.body?.text || payload.body_text || 'Interactive message';
+    }
     case 'button':
       return payload.button?.text || 'Button reply';
     default:
@@ -141,7 +147,6 @@ const ensureConversation = async ({
     $setOnInsert: {
       tenant_id: tenantId,
       contact_phone: contactPhone,
-      contact_name: String(contactName || '').trim(),
     },
   };
 
@@ -234,17 +239,19 @@ const recordInboundMessage = async ({
     {
       $setOnInsert: {
         tenant_id: tenantId,
-        conversation_id: conversation._id,
-        contact_id: contact._id,
+        contact_phone: phoneNumber,
+        contact_name: contact.name || contact.wa_name || contact.profile_name || '',
         whatsapp_message_id: message.id,
         direction: 'inbound',
         status: 'received',
-        type,
-        from: phoneNumber,
-        to: phoneNumberId || null,
-        text_body: preview,
-        payload: rawPayload,
-        message_timestamp: messageTimestamp,
+        message_type: type || 'unknown',
+        content: preview,
+        media_url: message.image?.link || message.video?.link || message.document?.link || message.audio?.link || null,
+        media_id: message.image?.id || message.video?.id || message.document?.id || message.audio?.id || null,
+        media_mime: message.image?.mime_type || message.video?.mime_type || message.document?.mime_type || message.audio?.mime_type || null,
+        media_filename: message.document?.filename || null,
+        interactive_payload: type === 'interactive' ? (message.interactive || null) : null,
+        timestamp: messageTimestamp,
       },
     },
     { new: true, upsert: true }
@@ -266,6 +273,7 @@ const recordOutboundMessage = async ({
   payload,
   whatsappMessageId,
   status = 'sent',
+  messageSource = null,
 }) => {
   const messageTimestamp = new Date();
   const preview = previewFromPayload(type, payload);
@@ -294,16 +302,21 @@ const recordOutboundMessage = async ({
     tenant_id: tenantId,
     conversation_id: conversation._id,
     contact_id: contact._id,
+    contact_phone: normalizedPhone,
+    contact_name: contact.name || contact.wa_name || contact.profile_name || '',
     whatsapp_message_id: whatsappMessageId || null,
     direction: 'outbound',
     status,
-    type,
-    from: phoneNumberId || null,
-    to: normalizedPhone,
-    text_body: preview,
-    payload,
-    message_timestamp: messageTimestamp,
-    sent_at: messageTimestamp,
+    message_type: type || 'text',
+    content: preview,
+    template_name: type === 'template' ? (payload?.template?.name || null) : null,
+    template_params: type === 'template' ? (payload?.template?.components || null) : null,
+    media_url: ['image', 'document', 'video', 'audio'].includes(type) ? (payload?.[type]?.link || null) : null,
+    media_filename: type === 'document' ? (payload?.document?.filename || null) : null,
+    interactive_payload: type === 'interactive' ? (payload?.interactive || null) : null,
+    message_source: messageSource || (type === 'interactive' ? 'interactive' : null),
+    sent_by: userId || null,
+    timestamp: messageTimestamp,
   });
 
   await recordAuditLog({

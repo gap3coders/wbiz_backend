@@ -9,10 +9,22 @@ const EmailVerification = require('../models/EmailVerification');
 const { authenticate } = require('../middleware/auth');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 const { generateToken, hashToken, createSlug, apiResponse } = require('../utils/helpers');
+const WhatsAppAccount = require('../models/WhatsAppAccount');
 const { parsePhoneInput } = require('../utils/phone');
 
 const router = express.Router();
 const localhostPattern = /(^|:\/\/)(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i;
+
+/** Set access token as httpOnly cookie */
+const setAccessTokenCookie = (res, token) => {
+  res.cookie('access_token', token, {
+    httpOnly: true,
+    secure: config.nodeEnv === 'production',
+    sameSite: 'lax',
+    maxAge: 15 * 60 * 1000, // 15 minutes — matches JWT expiry
+    path: '/',
+  });
+};
 const shouldExposeForgotPasswordDebug = (req) => {
   if (config.nodeEnv !== 'production') return true;
 
@@ -85,6 +97,7 @@ router.post('/register', async (req, res) => {
 
     // Link tenant to user
     user.tenant_id = tenant._id;
+    user.tenants = [tenant._id];
     await user.save();
 
     // Generate verification token
@@ -146,7 +159,7 @@ router.post('/verify-email', async (req, res) => {
 
     // Update user status
     const user = await User.findById(tokenDoc.user_id);
-    user.status = 'pending_setup';
+    user.status = 'pending_approval';
     user.email_verified_at = new Date();
     await user.save();
 
@@ -172,12 +185,13 @@ router.post('/verify-email', async (req, res) => {
       sameSite: 'lax',
       maxAge: 30 * 24 * 60 * 60 * 1000,
     });
+    setAccessTokenCookie(res, accessToken);
 
     return apiResponse(res, {
       data: {
         access_token: accessToken,
         user: user.toSafeJSON(),
-        redirect_to: '/portal/setup',
+        redirect_to: '/pending-approval',
       },
     });
   } catch (error) {
@@ -258,6 +272,15 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    if (user.status === 'pending_approval') {
+      return apiResponse(res, {
+        status: 403,
+        success: false,
+        error: 'Your account is pending admin approval',
+        data: { code: 'PENDING_APPROVAL' },
+      });
+    }
+
     if (user.status === 'suspended') {
       return apiResponse(res, { status: 403, success: false, error: 'Account suspended. Please contact support.' });
     }
@@ -292,10 +315,24 @@ router.post('/login', async (req, res) => {
       sameSite: 'lax',
       maxAge: refreshExpiry,
     });
+    setAccessTokenCookie(res, accessToken);
 
     // Determine redirect
     let redirect_to = '/portal/dashboard';
     if (user.status === 'pending_setup') redirect_to = '/portal/setup';
+    if (user.status === 'pending_plan') redirect_to = '/portal/pricing';
+
+    // Check if active user has expired plan
+    if (user.status === 'active' && user.tenant_id) {
+      const tenant = await Tenant.findById(user.tenant_id);
+      if (tenant && tenant.plan_status === 'trial' && tenant.trial_ends_at && new Date() > tenant.trial_ends_at) {
+        await Tenant.findByIdAndUpdate(user.tenant_id, { plan_status: 'expired' });
+      }
+      if (tenant && (tenant.plan_status === 'expired' || (!tenant.lifetime_access && tenant.plan_status !== 'active' && tenant.plan_status !== 'trial'))) {
+        // Still let them login but redirect to pricing
+        redirect_to = '/portal/pricing';
+      }
+    }
 
     return apiResponse(res, {
       data: {
@@ -358,6 +395,7 @@ router.post('/refresh', async (req, res) => {
       { expiresIn: config.jwt.accessExpiry }
     );
 
+    setAccessTokenCookie(res, accessToken);
     return apiResponse(res, { data: { access_token: accessToken } });
   } catch (error) {
     console.error('Refresh error:', error);
@@ -376,6 +414,7 @@ router.post('/logout', async (req, res) => {
       );
       res.clearCookie('refresh_token');
     }
+    res.clearCookie('access_token');
     return apiResponse(res, { data: { message: 'Logged out successfully' } });
   } catch (error) {
     return apiResponse(res, { status: 500, success: false, error: 'Logout failed' });
@@ -516,14 +555,195 @@ router.get('/me', authenticate, async (req, res) => {
     // Check if WhatsApp account is connected
     let whatsapp_account = null;
     if (tenant) {
-      const WhatsAppAccount = require('../models/WhatsAppAccount');
-      const wa = await WhatsAppAccount.findOne({ tenant_id: tenant._id }).select('-access_token_encrypted');
+      const wa = (await WhatsAppAccount.findOne({ tenant_id: tenant._id, is_default: true }).select('-access_token_encrypted'))
+        || (await WhatsAppAccount.findOne({ tenant_id: tenant._id }).select('-access_token_encrypted'));
       if (wa) whatsapp_account = wa;
     }
 
-    return apiResponse(res, { data: { user, tenant, whatsapp_account } });
+    // Load all tenants the user belongs to (for business switcher)
+    let all_tenants = [];
+    if (req.user.tenants && req.user.tenants.length > 0) {
+      all_tenants = await Tenant.find({ _id: { $in: req.user.tenants } })
+        .select('_id name slug plan plan_status setup_status')
+        .lean();
+    } else if (tenant) {
+      all_tenants = [{ _id: tenant._id, name: tenant.name, slug: tenant.slug, plan: tenant.plan, plan_status: tenant.plan_status, setup_status: tenant.setup_status || 'active' }];
+    }
+
+    return apiResponse(res, { data: { user, tenant, whatsapp_account, all_tenants } });
   } catch (error) {
     return apiResponse(res, { status: 500, success: false, error: 'Failed to fetch user' });
+  }
+});
+
+// ─── SWITCH TENANT (BUSINESS) ─────────────────────────────
+router.post('/switch-tenant', authenticate, async (req, res) => {
+  try {
+    const { tenant_id } = req.body;
+    if (!tenant_id) {
+      return apiResponse(res, { status: 400, success: false, error: 'tenant_id is required' });
+    }
+
+    const user = await User.findById(req.user._id);
+
+    // Verify user belongs to this tenant
+    const belongsTo = (user.tenants || []).some(
+      (t) => String(t) === String(tenant_id)
+    );
+    if (!belongsTo) {
+      return apiResponse(res, { status: 403, success: false, error: 'You do not have access to this business' });
+    }
+
+    // Update active tenant
+    user.tenant_id = tenant_id;
+    await user.save();
+
+    // Issue new JWT with updated tenantId
+    const accessToken = jwt.sign(
+      { userId: user._id, tenantId: tenant_id },
+      config.jwt.secret,
+      { expiresIn: config.jwt.accessExpiry }
+    );
+    setAccessTokenCookie(res, accessToken);
+
+    const tenant = await Tenant.findById(tenant_id);
+    let whatsapp_account = null;
+    if (tenant) {
+      const wa = (await WhatsAppAccount.findOne({ tenant_id: tenant._id, is_default: true }).select('-access_token_encrypted'))
+        || (await WhatsAppAccount.findOne({ tenant_id: tenant._id }).select('-access_token_encrypted'));
+      if (wa) whatsapp_account = wa;
+    }
+
+    return apiResponse(res, {
+      data: {
+        access_token: accessToken,
+        tenant,
+        whatsapp_account,
+        message: `Switched to ${tenant?.name || 'business'}`,
+      },
+    });
+  } catch (error) {
+    console.error('Switch tenant error:', error);
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to switch business' });
+  }
+});
+
+// ─── CREATE NEW BUSINESS (TENANT) ────────────────────────
+router.post('/create-business', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+
+    // Auto-generate a placeholder name — will be replaced by Meta business name after setup
+    const bizCount = (user.tenants || []).length + 1;
+    const placeholderName = `Business ${bizCount}`;
+
+    // Create new tenant with setup_status = pending_plan (needs to choose plan first)
+    const tenant = await Tenant.create({
+      owner_user_id: user._id,
+      name: placeholderName,
+      slug: createSlug(placeholderName + '-' + Date.now()),
+      setup_status: 'pending_plan',
+    });
+
+    // Add to user's tenants list and switch to it
+    user.tenants = [...(user.tenants || []), tenant._id];
+    user.tenant_id = tenant._id;
+    await user.save();
+
+    // Issue new JWT
+    const accessToken = jwt.sign(
+      { userId: user._id, tenantId: tenant._id },
+      config.jwt.secret,
+      { expiresIn: config.jwt.accessExpiry }
+    );
+    setAccessTokenCookie(res, accessToken);
+
+    return apiResponse(res, {
+      status: 201,
+      data: {
+        access_token: accessToken,
+        tenant,
+        redirect_to: '/portal/pricing',
+        message: `Business "${tenant.name}" created. Please choose a plan.`,
+      },
+    });
+  } catch (error) {
+    console.error('Create business error:', error);
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to create business' });
+  }
+});
+
+// ─── CANCEL SETUP (SWITCH BACK TO PREVIOUS BUSINESS) ──────
+router.post('/cancel-setup', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    const currentTenantId = String(user.tenant_id);
+
+    // Find the current (pending) tenant
+    const currentTenant = await Tenant.findById(currentTenantId);
+    const isPending = currentTenant && currentTenant.setup_status !== 'active';
+
+    // Find a previous active tenant to switch back to
+    const otherTenants = (user.tenants || []).filter(
+      (t) => String(t) !== currentTenantId
+    );
+
+    let switchToTenant = null;
+    if (otherTenants.length > 0) {
+      // Find an active one preferably
+      const activeTenant = await Tenant.findOne({
+        _id: { $in: otherTenants },
+        setup_status: 'active',
+      });
+      switchToTenant = activeTenant || await Tenant.findOne({ _id: { $in: otherTenants } });
+    }
+
+    if (!switchToTenant) {
+      return apiResponse(res, {
+        status: 400,
+        success: false,
+        error: 'No other business to switch to. Complete setup or contact support.',
+      });
+    }
+
+    // Optionally delete the pending tenant if it has no real data
+    const { delete_pending } = req.body;
+    if (delete_pending && isPending) {
+      // Remove from user's tenants array
+      user.tenants = (user.tenants || []).filter(
+        (t) => String(t) !== currentTenantId
+      );
+      // Delete the empty pending tenant
+      await Tenant.findByIdAndDelete(currentTenantId);
+    }
+
+    // Switch to the previous active business
+    user.tenant_id = switchToTenant._id;
+    await user.save();
+
+    // Issue new JWT
+    const accessToken = jwt.sign(
+      { userId: user._id, tenantId: switchToTenant._id },
+      config.jwt.secret,
+      { expiresIn: config.jwt.accessExpiry }
+    );
+    setAccessTokenCookie(res, accessToken);
+
+    return apiResponse(res, {
+      data: {
+        access_token: accessToken,
+        tenant: switchToTenant,
+        message: `Switched back to ${switchToTenant.name}`,
+        redirect_to: switchToTenant.setup_status === 'active'
+          ? '/portal/dashboard'
+          : switchToTenant.setup_status === 'pending_setup'
+          ? '/portal/setup'
+          : '/portal/pricing',
+      },
+    });
+  } catch (error) {
+    console.error('Cancel setup error:', error);
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to cancel setup' });
   }
 });
 

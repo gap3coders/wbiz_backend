@@ -8,6 +8,11 @@ const router = express.Router();
 
 router.use(authenticate, requireStatus('active'));
 
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 const normalizeKeywords = (keywords) =>
   Array.from(
     new Set(
@@ -82,18 +87,39 @@ const validateRulePayload = (payload) => {
 
 router.get('/', async (req, res) => {
   try {
-    const [rules, logs] = await Promise.all([
+    const logsLimit = Math.min(Math.max(Number(req.query.logs_limit) || 10, 1), 100);
+    const requestedLogsPage = parsePositiveInt(req.query.logs_page, 1);
+    const logQuery = { tenant_id: req.tenant._id };
+
+    const [rules, totalLogs, logStatusAgg] = await Promise.all([
       AutoResponseRule.find({ tenant_id: req.tenant._id }).sort({ priority: 1, created_at: -1 }).lean(),
-      AutoResponseLog.find({ tenant_id: req.tenant._id }).sort({ created_at: -1 }).limit(30).lean(),
+      AutoResponseLog.countDocuments(logQuery),
+      AutoResponseLog.aggregate([
+        { $match: logQuery },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
     ]);
+
+    const logPages = Math.max(1, Math.ceil(totalLogs / logsLimit));
+    const logsPage = Math.min(requestedLogsPage, logPages);
+    const logs = await AutoResponseLog.find(logQuery)
+      .sort({ created_at: -1 })
+      .skip((logsPage - 1) * logsLimit)
+      .limit(logsLimit)
+      .lean();
+
+    const logTotals = { sent: 0, failed: 0, skipped: 0 };
+    logStatusAgg.forEach((row) => {
+      logTotals[row._id] = row.count;
+    });
 
     const summary = {
       total_rules: rules.length,
       active_rules: rules.filter((rule) => rule.active).length,
       keyword_rules: rules.filter((rule) => rule.trigger_type === 'keyword').length,
       welcome_rules: rules.filter((rule) => rule.trigger_type === 'welcome').length,
-      sent_count: logs.filter((log) => log.status === 'sent').length,
-      failed_count: logs.filter((log) => log.status === 'failed').length,
+      sent_count: logTotals.sent || 0,
+      failed_count: logTotals.failed || 0,
     };
 
     return apiResponse(res, {
@@ -101,6 +127,14 @@ router.get('/', async (req, res) => {
         rules,
         logs,
         summary,
+        pagination: {
+          logs: {
+            page: logsPage,
+            limit: logsLimit,
+            total: totalLogs,
+            pages: logPages,
+          },
+        },
       },
     });
   } catch (error) {
@@ -190,12 +224,30 @@ router.delete('/:id', async (req, res) => {
 
 router.get('/logs/history', async (req, res) => {
   try {
-    const logs = await AutoResponseLog.find({ tenant_id: req.tenant._id })
+    const requestedPage = parsePositiveInt(req.query.page, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const query = { tenant_id: req.tenant._id };
+    const total = await AutoResponseLog.countDocuments(query);
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const page = Math.min(requestedPage, pages);
+
+    const logs = await AutoResponseLog.find(query)
       .sort({ created_at: -1 })
-      .limit(100)
+      .skip((page - 1) * limit)
+      .limit(limit)
       .lean();
 
-    return apiResponse(res, { data: { logs } });
+    return apiResponse(res, {
+      data: {
+        logs,
+        pagination: {
+          page,
+          limit,
+          total,
+          pages,
+        },
+      },
+    });
   } catch (error) {
     console.error('[Auto Responses Route][Logs Failed]', {
       tenant_id: String(req.tenant?._id || ''),

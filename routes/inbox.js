@@ -35,10 +35,12 @@ router.get('/conversations', async (req, res) => {
         tenant_id: tenantId,
         $or: [
           { name: regex },
+          { wa_name: regex },
           { profile_name: regex },
           { phone: regex },
           { whatsapp_id: regex },
           { email: regex },
+          { labels: regex },
           { tags: regex },
         ],
       }).select('phone');

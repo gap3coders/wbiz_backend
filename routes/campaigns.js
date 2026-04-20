@@ -11,11 +11,39 @@ const { emitToTenant } = require('../services/socketService');
 const { apiResponse } = require('../utils/helpers');
 const router = express.Router();
 
-const getWA = async (tid) => { const wa=await WhatsAppAccount.findOne({tenant_id:tid}); if(!wa) throw new Error('No account'); return {wa,token:decrypt(wa.access_token_encrypted)}; };
+const getWA = async (tenantId) => {
+  const wa = await WhatsAppAccount.findOne({ tenant_id: tenantId, is_default: true })
+    || await WhatsAppAccount.findOne({ tenant_id: tenantId });
+  if (!wa) throw new Error('No account');
+  return { wa, token: decrypt(wa.access_token_encrypted) };
+};
+
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const normalizePhone = (value) => String(value || '').replace(/[^\d]/g, '');
+
+const uniquePhones = (values = []) =>
+  Array.from(new Set((Array.isArray(values) ? values : []).map((item) => normalizePhone(item)).filter(Boolean)));
+
 const safeEmail = (value) => {
   const normalized = String(value || '').trim();
   return normalized || 'N/A';
+};
+
+const getFileNameFromUrl = (value = '') => {
+  const source = String(value || '').trim();
+  if (!source) return '';
+  try {
+    const parsed = new URL(source);
+    return decodeURIComponent(parsed.pathname.split('/').pop() || '');
+  } catch {
+    return decodeURIComponent(source.split('?')[0].split('/').pop() || '');
+  }
 };
 
 const renderTemplateBodyPreview = (bodyTemplate = '', bodyParameters = []) => {
@@ -27,16 +55,76 @@ const renderTemplateBodyPreview = (bodyTemplate = '', bodyParameters = []) => {
   return rendered.trim();
 };
 
-const resolveRecipients = async ({ tenantId, targetType, targetTags, recipients }) => {
+const extractTemplateBodyText = (components = []) =>
+  String(
+    (Array.isArray(components) ? components : []).find(
+      (item) => String(item?.type || '').toLowerCase() === 'body'
+    )?.text || ''
+  );
+
+const extractHeaderPreview = (components = []) => {
+  const headerParam = (Array.isArray(components) ? components : [])
+    .filter((item) => String(item?.type || '').toLowerCase() === 'header')
+    .flatMap((item) => item.parameters || [])
+    .find((param) => param?.document?.link || param?.image?.link || param?.video?.link);
+
+  const link = headerParam?.document?.link || headerParam?.image?.link || headerParam?.video?.link || '';
+  const type = String(headerParam?.type || '').toLowerCase();
+
+  return {
+    link,
+    type,
+    file_name: getFileNameFromUrl(link),
+  };
+};
+
+const resolveRecipients = async ({ tenantId, targetType, targetTags, recipients, targetCustomField, targetCustomValue }) => {
   if (targetType === 'all') {
-    const contacts = await Contact.find({ tenant_id: tenantId, opt_in: true }).select('phone');
-    return contacts.map((contact) => contact.phone).filter(Boolean);
+    const contacts = await Contact.find({ tenant_id: tenantId, opt_in: { $ne: false } }).select('phone').lean();
+    return uniquePhones(contacts.map((contact) => contact.phone));
   }
   if (targetType === 'tags' && targetTags?.length) {
-    const contacts = await Contact.find({ tenant_id: tenantId, labels: { $in: targetTags }, opt_in: true }).select('phone');
-    return contacts.map((contact) => contact.phone).filter(Boolean);
+    const contacts = await Contact.find({
+      tenant_id: tenantId,
+      opt_in: { $ne: false },
+      $or: [
+        { labels: { $in: targetTags } },
+        { tags: { $in: targetTags } },
+      ],
+    }).select('phone').lean();
+    return uniquePhones(contacts.map((contact) => contact.phone));
   }
-  return Array.isArray(recipients) ? recipients.filter(Boolean) : [];
+  if (targetType === 'custom_field' && targetCustomField && targetCustomValue) {
+    const fieldKey = `custom_fields.${targetCustomField}`;
+    const contacts = await Contact.find({
+      tenant_id: tenantId,
+      opt_in: { $ne: false },
+      [fieldKey]: { $regex: new RegExp(targetCustomValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') },
+    }).select('phone').lean();
+    return uniquePhones(contacts.map(c => c.phone));
+  }
+  return uniquePhones(recipients);
+};
+
+const ensureIndividualHeaderMediaCoverage = ({ phones = [], variableMapping = {} } = {}) => {
+  const headerMediaMode = String(variableMapping.__header_media_mode || 'global').toLowerCase();
+  if (headerMediaMode !== 'individual') return;
+
+  const headerMediaType = String(variableMapping.__header_media_type || 'file').toUpperCase();
+  const headerMediaByContact = variableMapping.__header_media_by_contact && typeof variableMapping.__header_media_by_contact === 'object'
+    ? variableMapping.__header_media_by_contact
+    : {};
+  const missingPhones = uniquePhones(phones).filter((phone) => !String(headerMediaByContact?.[phone] || '').trim());
+
+  if (!missingPhones.length) return;
+
+  const preview = missingPhones.slice(0, 5).join(', ');
+  const suffix = missingPhones.length > 5 ? '...' : '';
+  const error = new Error(`Missing ${headerMediaType} file URL for ${missingPhones.length} contact(s): ${preview}${suffix}`);
+  error.source = 'platform';
+  error.code = 'missing_header_media';
+  error.metaMissingPhones = missingPhones;
+  throw error;
 };
 
 const resolveVariable = (mapping, contact, fallbackText) => {
@@ -45,12 +133,22 @@ const resolveVariable = (mapping, contact, fallbackText) => {
     if (mapping === 'contact_name') return contact?.name || contact?.wa_name || fallbackText || 'N/A';
     if (mapping === 'contact_phone') return contact?.phone || fallbackText || '-';
     if (mapping === 'contact_email') return safeEmail(contact?.email || fallbackText);
+    if (mapping.startsWith('custom_field:')) {
+      const fieldName = mapping.slice('custom_field:'.length);
+      const cf = contact?.custom_fields && typeof contact.custom_fields === 'object' ? contact.custom_fields : {};
+      return cf[fieldName] != null ? String(cf[fieldName]) : (fallbackText || '');
+    }
     return fallbackText;
   }
   const source = String(mapping.source || mapping.type || 'static');
   if (source === 'contact_name') return contact?.name || contact?.wa_name || String(mapping.value || fallbackText || 'N/A');
   if (source === 'contact_phone') return contact?.phone || String(mapping.value || fallbackText || '-');
   if (source === 'contact_email') return safeEmail(contact?.email || mapping.value || fallbackText);
+  if (source.startsWith('custom_field:')) {
+    const fieldName = source.slice('custom_field:'.length);
+    const cf = contact?.custom_fields && typeof contact.custom_fields === 'object' ? contact.custom_fields : {};
+    return cf[fieldName] != null ? String(cf[fieldName]) : String(mapping.value || fallbackText || '');
+  }
   return String(mapping.value || fallbackText || '');
 };
 
@@ -86,15 +184,28 @@ const normalizeTemplateComponents = (campaign, contact) => {
       const key = `${slot}_${index}`;
       const mapping = variableMapping[key];
       const baseParameter = baseParameters[index - 1] || {};
-      if (slot === 'header' && ['image', 'video', 'document'].includes(String(baseParameter.type || '').toLowerCase())) {
-        const mappedUrl = headerMediaMode === 'individual'
-          ? String(headerMediaByContact?.[contact?.phone] || '').trim()
-          : '';
-        const resolvedUrl = mappedUrl || headerMediaGlobal || String(baseParameter?.[String(baseParameter.type || '').toLowerCase()]?.link || '').trim();
+      const baseParameterType = String(baseParameter.type || '').toLowerCase();
+
+      if (slot === 'header' && ['image', 'video', 'document'].includes(baseParameterType)) {
         const resolvedType = String(baseParameter.type || headerMediaType || '').toLowerCase();
+        const fallbackUrl = String(baseParameter?.[resolvedType]?.link || '').trim();
+
+        if (headerMediaMode === 'individual') {
+          const mappedUrl = String(headerMediaByContact?.[contact?.phone] || '').trim();
+          if (!mappedUrl) {
+            const error = new Error(`Missing ${(resolvedType || headerMediaType || 'file').toUpperCase()} file URL for contact ${contact?.phone || 'unknown'}`);
+            error.source = 'platform';
+            error.code = 'missing_header_media';
+            throw error;
+          }
+          return { type: resolvedType, [resolvedType]: { link: mappedUrl } };
+        }
+
+        const resolvedUrl = headerMediaGlobal || fallbackUrl;
         if (resolvedType && resolvedUrl) {
           return { type: resolvedType, [resolvedType]: { link: resolvedUrl } };
         }
+        return null;
       }
       const hasMapping = Object.prototype.hasOwnProperty.call(variableMapping, key);
       if (!hasMapping && baseParameter.type && baseParameter.type !== 'text') {
@@ -106,7 +217,7 @@ const normalizeTemplateComponents = (campaign, contact) => {
       const baseText = String(baseParameter.text || '').trim();
       const resolved = String(resolveVariable(mapping, contact, baseText) || '').trim();
       return { type: 'text', text: resolved || baseText || '-' };
-    });
+    }).filter(Boolean);
 
     if (parameters.length) {
       result.push({
@@ -149,6 +260,7 @@ const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
   let accepted = 0;
   let failed = 0;
   const errors = [];
+  const bodyTemplateText = extractTemplateBodyText(campaign.template_components);
 
   try {
     const { wa, token } = await getWA(tenantId);
@@ -160,12 +272,27 @@ const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
     emitToTenant(tenantId, 'campaign:progress', { id: campaign._id, event: 'running' });
 
     for (const phone of campaign.recipients || []) {
+      let comps = [];
+      let bodyPreview = `[Campaign: ${campaign.name}]`;
+      let headerPreview = { link: '', type: '', file_name: '' };
+      let contactPreview = { name: phone, wa_name: '', email: 'N/A', phone };
+
       try {
-        const contact = await Contact.findOne({ tenant_id: tenantId, phone });
+        const contact = await Contact.findOne({ tenant_id: tenantId, phone })
+          .select('name wa_name email phone custom_fields')
+          .lean();
         const normalizedContact = contact || { name: 'N/A', wa_name: 'N/A', email: 'N/A', phone };
+        normalizedContact.phone = normalizePhone(normalizedContact.phone || phone);
         normalizedContact.email = safeEmail(normalizedContact.email);
         if (!normalizedContact.name && !normalizedContact.wa_name) normalizedContact.name = 'N/A';
-        const comps = normalizeTemplateComponents(campaign, normalizedContact);
+        contactPreview = normalizedContact;
+        comps = normalizeTemplateComponents(campaign, normalizedContact);
+        const bodyParameters = comps
+          .filter((item) => String(item?.type || '').toLowerCase() === 'body')
+          .flatMap((item) => item.parameters || [])
+          .map((item) => String(item?.text || '').trim());
+        bodyPreview = renderTemplateBodyPreview(bodyTemplateText, bodyParameters) || `[Campaign: ${campaign.name}]`;
+        headerPreview = extractHeaderPreview(comps);
         const result = await metaService.sendTemplateMessage(
           wa.phone_number_id,
           token,
@@ -178,39 +305,23 @@ const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
         await Message.create({
           tenant_id: tenantId,
           contact_phone: phone,
+          contact_name: normalizedContact.name || normalizedContact.wa_name || phone,
           direction: 'outbound',
           message_type: 'template',
-          content: renderTemplateBodyPreview(
-            String(campaign.template_components?.find((item) => String(item?.type || '').toLowerCase() === 'body')?.text || ''),
-            comps
-              .filter((item) => String(item?.type || '').toLowerCase() === 'body')
-              .flatMap((item) => item.parameters || [])
-              .map((item) => String(item?.text || '').trim())
-          ) || `[Campaign: ${campaign.name}]`,
+          content: bodyPreview,
           template_name: campaign.template_name,
           template_params: {
             components: comps,
             preview: {
-              body_text: renderTemplateBodyPreview(
-                String(campaign.template_components?.find((item) => String(item?.type || '').toLowerCase() === 'body')?.text || ''),
-                comps
-                  .filter((item) => String(item?.type || '').toLowerCase() === 'body')
-                  .flatMap((item) => item.parameters || [])
-                  .map((item) => String(item?.text || '').trim())
-              ),
-              template_body_text: String(campaign.template_components?.find((item) => String(item?.type || '').toLowerCase() === 'body')?.text || ''),
-              header_link: comps
-                .filter((item) => String(item?.type || '').toLowerCase() === 'header')
-                .flatMap((item) => item.parameters || [])
-                .map((param) => param?.document?.link || param?.image?.link || param?.video?.link || '')
-                .find(Boolean) || '',
-              header_type: comps
-                .filter((item) => String(item?.type || '').toLowerCase() === 'header')
-                .flatMap((item) => item.parameters || [])
-                .map((param) => param?.type || '')
-                .find(Boolean) || '',
+              body_text: bodyPreview,
+              template_body_text: bodyTemplateText,
+              header_link: headerPreview.link,
+              header_type: headerPreview.type,
+              header_file_name: headerPreview.file_name,
             },
           },
+          media_url: headerPreview.link || null,
+          media_filename: headerPreview.file_name || null,
           wa_message_id: result.messages?.[0]?.id,
           status: 'sent',
           campaign_id: campaign._id,
@@ -226,14 +337,27 @@ const launchCampaignInBackground = async ({ campaignId, tenantId, userId }) => {
         const errMsg = err.source === 'meta'
           ? `[Meta] ${err.message}${metaDetail ? ` | ${metaDetail}` : ''}`
           : `[Platform] ${err.message}`;
-        errors.push({ phone, error: errMsg, source: err.source || 'platform', code: err.metaError?.code || null });
+        errors.push({ phone, error: errMsg, source: err.source || 'platform', code: err.metaError?.code || err.code || null });
         await Message.create({
           tenant_id: tenantId,
           contact_phone: phone,
+          contact_name: contactPreview.name || contactPreview.wa_name || phone,
           direction: 'outbound',
           message_type: 'template',
-          content: `[Campaign: ${campaign.name}]`,
+          content: bodyPreview,
           template_name: campaign.template_name,
+          template_params: {
+            components: comps,
+            preview: {
+              body_text: bodyPreview === `[Campaign: ${campaign.name}]` ? '' : bodyPreview,
+              template_body_text: bodyTemplateText,
+              header_link: headerPreview.link,
+              header_type: headerPreview.type,
+              header_file_name: headerPreview.file_name,
+            },
+          },
+          media_url: headerPreview.link || null,
+          media_filename: headerPreview.file_name || null,
           status: 'failed',
           error_message: errMsg,
           error_source: err.source || 'platform',
@@ -289,34 +413,86 @@ router.get('/', authenticate, requireStatus('active'), async (req, res) => {
 
 router.get('/:id', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const campaign = await Campaign.findOne({_id:req.params.id,tenant_id:req.tenant._id});
-    if (!campaign) return apiResponse(res, {status:404,success:false,error:'Not found'});
-    // Get live message stats
-    const msgStats = await Message.aggregate([{$match:{tenant_id:req.tenant._id,campaign_id:campaign._id}},{$group:{_id:'$status',count:{$sum:1}}}]);
-    const live = {sent:0,delivered:0,read:0,failed:0};
-    msgStats.forEach(s => { live[s._id] = s.count; });
-    // Get errors
-    const errors = await Message.find({tenant_id:req.tenant._id,campaign_id:campaign._id,status:'failed'}).select('contact_phone error_message error_source').limit(50).lean();
-    return apiResponse(res, {data:{campaign,live_stats:live,errors}});
+    const requestedPage = parsePositiveInt(req.query.page, 1);
+    const limit = Math.min(parsePositiveInt(req.query.limit, 25), 100);
+    const campaign = await Campaign.findOne({ _id: req.params.id, tenant_id: req.tenant._id });
+    if (!campaign) return apiResponse(res, { status: 404, success: false, error: 'Not found' });
+
+    const [msgStats, totalMessages, errors] = await Promise.all([
+      Message.aggregate([
+        { $match: { tenant_id: req.tenant._id, campaign_id: campaign._id } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
+      Message.countDocuments({ tenant_id: req.tenant._id, campaign_id: campaign._id }),
+      Message.find({ tenant_id: req.tenant._id, campaign_id: campaign._id, status: 'failed' })
+        .select('contact_phone error_message error_source media_url media_filename template_params timestamp')
+        .sort({ timestamp: -1, _id: -1 })
+        .limit(50)
+        .lean(),
+    ]);
+
+    const live = { queued: 0, sent: 0, delivered: 0, read: 0, failed: 0 };
+    msgStats.forEach((row) => { live[row._id] = row.count; });
+
+    const pages = Math.max(1, Math.ceil(totalMessages / limit));
+    const page = Math.min(requestedPage, pages);
+    const skip = (page - 1) * limit;
+    const messages = await Message.find({ tenant_id: req.tenant._id, campaign_id: campaign._id })
+      .select('contact_phone contact_name status content template_name template_params media_url media_filename error_message error_source timestamp')
+      .sort({ timestamp: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    return apiResponse(res, {
+      data: {
+        campaign,
+        live_stats: live,
+        errors,
+        messages,
+        pagination: {
+          page,
+          limit,
+          total: totalMessages,
+          pages,
+        },
+      },
+    });
   } catch(e) { return apiResponse(res, {status:500,success:false,error:'Failed'}); }
 });
 
 router.post('/', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const { name, template_name, template_language, template_components, variable_mapping, target_type, target_tags, recipients, scheduled_at } = req.body;
+    const { name, template_name, template_language, template_components, variable_mapping, target_type, target_tags, recipients, scheduled_at, target_custom_field, target_custom_value, send_completion_report, report_recipients, auto_resend_failed, auto_resend_delay_hours, tag_by_status, tag_prefix, auto_unsubscribe_failures, auto_unsubscribe_threshold } = req.body;
     if (!name||!template_name) return apiResponse(res, {status:400,success:false,error:'[Platform] name and template required'});
     const phones = await resolveRecipients({
       tenantId: req.tenant._id,
       targetType: target_type,
       targetTags: target_tags,
       recipients,
+      targetCustomField: target_custom_field,
+      targetCustomValue: target_custom_value,
+    });
+    ensureIndividualHeaderMediaCoverage({
+      phones,
+      variableMapping: variable_mapping || {},
     });
     const campaign = await Campaign.create({
       tenant_id:req.tenant._id, name, template_name, template_language:template_language||'en',
-      template_components:template_components||[], variable_mapping:variable_mapping||{},
+      template_components:template_components||[], variable_mapping: { ...(variable_mapping || {}), __target_custom_field: target_custom_field || null, __target_custom_value: target_custom_value || null },
       target_type:target_type||'selected', target_tags:target_tags||[], recipients:phones,
       scheduled_at:scheduled_at||null, status:scheduled_at?'scheduled':'draft',
       stats:{total:phones.length}, created_by:req.user._id,
+      send_completion_report: send_completion_report !== false,
+      report_recipients: typeof report_recipients === 'string'
+        ? report_recipients.split(',').map(e => e.trim()).filter(e => e.includes('@'))
+        : Array.isArray(report_recipients) ? report_recipients : [],
+      auto_resend_failed: !!auto_resend_failed,
+      auto_resend_delay_hours: Math.min(48, Math.max(1, parseInt(auto_resend_delay_hours, 10) || 2)),
+      tag_by_status: !!tag_by_status,
+      tag_prefix: String(tag_prefix || '').trim(),
+      auto_unsubscribe_failures: !!auto_unsubscribe_failures,
+      auto_unsubscribe_threshold: Math.min(10, Math.max(2, parseInt(auto_unsubscribe_threshold, 10) || 3)),
     });
 
     if (!scheduled_at) {
@@ -332,7 +508,10 @@ router.post('/', authenticate, requireStatus('active'), async (req, res) => {
     }
     emitToTenant(req.tenant._id, 'campaign:progress', { id: campaign._id, event: 'scheduled' });
     return apiResponse(res, {status:201,data:{campaign, launch:'scheduled'}});
-  } catch(e) { return apiResponse(res, {status:500,success:false,error:`[Platform] ${e.message}`}); }
+  } catch(e) {
+    const status = e.source === 'platform' ? 400 : 500;
+    return apiResponse(res, {status,success:false,error:`[Platform] ${e.message}`});
+  }
 });
 
 router.post('/:id/launch', authenticate, requireStatus('active'), async (req, res) => {
@@ -392,6 +571,29 @@ router.post('/:id/rerun', authenticate, requireStatus('active'), async (req, res
   } catch (error) {
     return apiResponse(res, { status: 500, success: false, error: error.message || 'Failed' });
   }
+});
+
+router.post('/:id/pause', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const campaign = await Campaign.findOne({ _id: req.params.id, tenant_id: req.tenant._id });
+    if (!campaign) return apiResponse(res, { status: 404, success: false, error: 'Not found' });
+    if (campaign.status !== 'running') return apiResponse(res, { status: 400, success: false, error: 'Only running campaigns can be paused' });
+    campaign.status = 'paused';
+    await campaign.save();
+    emitToTenant(req.tenant._id, 'campaign:progress', { id: campaign._id, event: 'paused' });
+    return apiResponse(res, { data: { campaign } });
+  } catch (e) { return apiResponse(res, { status: 500, success: false, error: 'Failed to pause campaign' }); }
+});
+
+router.post('/:id/resume', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const campaign = await Campaign.findOne({ _id: req.params.id, tenant_id: req.tenant._id });
+    if (!campaign) return apiResponse(res, { status: 404, success: false, error: 'Not found' });
+    if (campaign.status !== 'paused') return apiResponse(res, { status: 400, success: false, error: 'Only paused campaigns can be resumed' });
+    launchCampaignInBackground({ campaignId: campaign._id, tenantId: req.tenant._id, userId: req.user._id }).catch(console.error);
+    emitToTenant(req.tenant._id, 'campaign:progress', { id: campaign._id, event: 'resumed' });
+    return apiResponse(res, { data: { message: 'Campaign resumed' } });
+  } catch (e) { return apiResponse(res, { status: 500, success: false, error: 'Failed to resume campaign' }); }
 });
 
 router.delete('/:id', authenticate, requireStatus('active'), async (req, res) => {

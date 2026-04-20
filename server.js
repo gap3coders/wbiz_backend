@@ -12,6 +12,7 @@ const authRoutes = require('./routes/auth');
 const metaRoutes = require('./routes/meta');
 const webhookRoutes = require('./routes/webhook');
 const contactsRoutes = require('./routes/contacts');
+const customFieldsRoutes = require('./routes/customFields');
 const conversationsRoutes = require('./routes/conversations');
 const campaignsRoutes = require('./routes/campaigns');
 const analyticsRoutes = require('./routes/analytics');
@@ -20,6 +21,19 @@ const notificationsRoutes = require('./routes/notifications');
 const logsRoutes = require('./routes/logs');
 const mediaRoutes = require('./routes/media');
 const autoResponsesRoutes = require('./routes/autoResponses');
+const quickRepliesRoutes = require('./routes/quickReplies');
+const contactListsRoutes = require('./routes/contactLists');
+const messagingRoutes = require('./routes/messaging');
+const inboxRoutes = require('./routes/inbox');
+const teamRoutes = require('./routes/team');
+const dateTriggersRoutes = require('./routes/dateTriggers');
+const templatesRoutes = require('./routes/templates');
+const flowsRoutes = require('./routes/flows');
+const apiKeysRoutes = require('./routes/apiKeys');
+const interactiveTemplatesRoutes = require('./routes/interactiveTemplates');
+const adminAuthRoutes = require('./routes/adminAuth');
+const adminRoutes = require('./routes/admin');
+const seedAdmin = require('./seeds/seedAdmin');
 const Message = require('./models/Message');
 const Conversation = require('./models/Conversation');
 const Contact = require('./models/Contact');
@@ -45,7 +59,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  allowedHeaders: ['Content-Type','Authorization','X-API-Key'],
 };
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
@@ -77,7 +91,7 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.status(200).json({
     success: true,
-    service: 'whatsapp-saas-backend',
+    service: 'wbiz-backend',
     status: bootstrapped ? 'ok' : bootstrapError ? 'error' : 'starting',
     health: '/health',
   });
@@ -112,6 +126,7 @@ app.use('/api/v1/auth', readinessGuard, authLimiter, authRoutes);
 app.use('/api/v1/meta', readinessGuard, apiLimiter, metaRoutes);
 app.use('/api/v1/webhook', readinessGuard, webhookRoutes);
 app.use('/api/v1/contacts', readinessGuard, apiLimiter, contactsRoutes);
+app.use('/api/v1/custom-fields', readinessGuard, apiLimiter, customFieldsRoutes);
 app.use('/api/v1/conversations', readinessGuard, apiLimiter, conversationsRoutes);
 app.use('/api/v1/campaigns', readinessGuard, apiLimiter, campaignsRoutes);
 app.use('/api/v1/analytics', readinessGuard, apiLimiter, analyticsRoutes);
@@ -120,6 +135,18 @@ app.use('/api/v1/notifications', readinessGuard, apiLimiter, notificationsRoutes
 app.use('/api/v1/logs', readinessGuard, apiLimiter, logsRoutes);
 app.use('/api/v1/media', readinessGuard, apiLimiter, mediaRoutes);
 app.use('/api/v1/auto-responses', readinessGuard, apiLimiter, autoResponsesRoutes);
+app.use('/api/v1/quick-replies', readinessGuard, apiLimiter, quickRepliesRoutes);
+app.use('/api/v1/contact-lists', readinessGuard, apiLimiter, contactListsRoutes);
+app.use('/api/v1/messaging', readinessGuard, apiLimiter, messagingRoutes);
+app.use('/api/v1/inbox', readinessGuard, apiLimiter, inboxRoutes);
+app.use('/api/v1/team', readinessGuard, apiLimiter, teamRoutes);
+app.use('/api/v1/date-triggers', readinessGuard, apiLimiter, dateTriggersRoutes);
+app.use('/api/v1/templates', readinessGuard, apiLimiter, templatesRoutes);
+app.use('/api/v1/flows', readinessGuard, apiLimiter, flowsRoutes);
+app.use('/api/v1/api-keys', readinessGuard, apiLimiter, apiKeysRoutes);
+app.use('/api/v1/interactive-templates', readinessGuard, apiLimiter, interactiveTemplatesRoutes);
+app.use('/api/v1/admin/auth', readinessGuard, apiLimiter, adminAuthRoutes);
+app.use('/api/v1/admin', readinessGuard, apiLimiter, adminRoutes);
 
 app.use((req, res) => res.status(404).json({ success:false, error:`Route ${req.method} ${req.originalUrl} not found` }));
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).json({ success:false, error: config.nodeEnv==='development'?err.message:'Internal server error' }); });
@@ -134,6 +161,7 @@ const bootstrapApp = async () => {
     await Contact.migrateToSinglePhoneField();
     await Message.migrateLegacyIndexesAndIds();
     await Conversation.migrateIndexesForSinglePhone();
+    await seedAdmin();
     bootstrapped = true;
   })().catch((error) => {
     bootstrapError = error;
@@ -150,7 +178,7 @@ const startServer = async () => {
     if (!config.verboseLogs) return;
     console.log(`
 ╔══════════════════════════════════════════════╗
-║  WhatsApp SaaS Platform — Advanced Backend   ║
+║  WBIZ.IN — WhatsApp Business Platform        ║
 ╠══════════════════════════════════════════════╣
 ║  Environment : ${config.nodeEnv.padEnd(29)}║
 ║  Port        : ${String(config.port).padEnd(29)}║
@@ -161,10 +189,26 @@ const startServer = async () => {
   });
   bootstrapApp().catch((error) => console.error(error));
 
-  // Initialize socket server (if available) and keep-alive
+  // Initialize socket server (if available)
   try {
     const { initializeSocketServer } = require('./services/socketService');
     initializeSocketServer(server);
+  } catch {}
+
+  // Initialize campaign queue (if Redis available)
+  try {
+    const { initializeCampaignQueue } = require('./services/campaignQueue');
+    initializeCampaignQueue().catch((err) => {
+      if (config.verboseLogs) console.warn('[Server] Campaign queue init failed:', err.message);
+    });
+  } catch {}
+
+  // Initialize date trigger queue (if Redis available)
+  try {
+    const { initializeDateTriggerQueue } = require('./services/dateTriggerService');
+    initializeDateTriggerQueue().catch((err) => {
+      if (config.verboseLogs) console.warn('[Server] Date trigger queue init failed:', err.message);
+    });
   } catch {}
 
   const runHealthProbe = async () => {

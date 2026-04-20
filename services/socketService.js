@@ -5,6 +5,7 @@ try {
   Server = null;
 }
 const jwt = require('jsonwebtoken');
+const cookie = require('cookie');
 const config = require('../config');
 
 let io = null;
@@ -24,12 +25,21 @@ const initializeSocketServer = (httpServer) => {
     },
   });
 
+  // Auth middleware — accepts httpOnly cookie, auth token, or Bearer header
   io.use((socket, next) => {
     try {
-      const token =
-        socket.handshake.auth?.token ||
-        socket.handshake.headers?.authorization?.replace(/^Bearer\s+/i, '') ||
-        socket.handshake.query?.token;
+      let token = socket.handshake.auth?.token || socket.handshake.query?.token || null;
+
+      // Try httpOnly cookie if no explicit token
+      if (!token && socket.handshake.headers?.cookie) {
+        const cookies = cookie.parse(socket.handshake.headers.cookie);
+        token = cookies.access_token || null;
+      }
+
+      // Fallback: Bearer header
+      if (!token && socket.handshake.headers?.authorization) {
+        token = socket.handshake.headers.authorization.replace(/^Bearer\s+/i, '');
+      }
 
       if (!token) {
         return next(new Error('Authentication token required'));

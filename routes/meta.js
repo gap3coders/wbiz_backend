@@ -34,8 +34,15 @@ const normalizeQualityRating = (...values) => {
   return 'unknown';
 };
 
-const getWA = async (tenantId) => {
-  const wa = await WhatsAppAccount.findOne({ tenant_id: tenantId });
+const getWA = async (tenantId, accountId) => {
+  let wa;
+  if (accountId) {
+    wa = await WhatsAppAccount.findOne({ _id: accountId, tenant_id: tenantId });
+  } else {
+    // Prefer the default account; fall back to any account for backward compat
+    wa = await WhatsAppAccount.findOne({ tenant_id: tenantId, is_default: true })
+      || await WhatsAppAccount.findOne({ tenant_id: tenantId });
+  }
   if (!wa) throw { status:404, message:'No WhatsApp account connected. Complete setup first.', source:'platform' };
   return { wa, token: decrypt(wa.access_token_encrypted) };
 };
@@ -222,9 +229,36 @@ router.post('/save-config', authenticate, requireStatus('pending_setup','active'
     if (!pending) return apiResponse(res, { status:400, success:false, error:'[Platform] Session expired. Please reconnect.', error_source:'platform' });
     const accessToken = decrypt(pending.token);
     const phoneDetail = await metaService.fetchPhoneDetail(phone_number_id, accessToken);
-    await WhatsAppAccount.findOneAndUpdate({ tenant_id: req.tenant._id }, { tenant_id:req.tenant._id, waba_id, phone_number_id, display_phone_number:phoneDetail.display_phone_number, display_name:phoneDetail.verified_name, access_token_encrypted:encrypt(accessToken), token_expires_at:pending.tokenExpiresAt, account_status:'active', quality_rating:normalizeQualityRating(phoneDetail.quality_rating), webhook_verified:true }, { upsert:true, new:true });
+    const existingCount = await WhatsAppAccount.countDocuments({ tenant_id: req.tenant._id });
+    const isFirstAccount = existingCount === 0;
+    await WhatsAppAccount.findOneAndUpdate(
+      { tenant_id: req.tenant._id, phone_number_id },
+      {
+        tenant_id: req.tenant._id,
+        waba_id,
+        phone_number_id,
+        display_phone_number: phoneDetail.display_phone_number,
+        display_name: phoneDetail.verified_name,
+        access_token_encrypted: encrypt(accessToken),
+        token_expires_at: pending.tokenExpiresAt,
+        account_status: 'active',
+        quality_rating: normalizeQualityRating(phoneDetail.quality_rating),
+        webhook_verified: true,
+        ...(isFirstAccount ? { is_default: true } : {}),
+      },
+      { upsert: true, new: true }
+    );
     try { await metaService.subscribeWebhook(waba_id, accessToken); } catch(e) { console.error('Webhook sub error:', e.message); }
-    await User.findByIdAndUpdate(req.user._id, { status: 'active' });
+    // Mark user as active (for first-time onboarding)
+    if (req.user.status === 'pending_setup') {
+      await User.findByIdAndUpdate(req.user._id, { status: 'active' });
+    }
+    // Update tenant name from Meta verified business name (replaces placeholder)
+    const tenantUpdate = { setup_status: 'active' };
+    if (phoneDetail.verified_name) {
+      tenantUpdate.name = phoneDetail.verified_name;
+    }
+    await Tenant.findByIdAndUpdate(req.tenant._id, tenantUpdate);
     pendingTokens.delete(req.user._id.toString());
     return apiResponse(res, { data: { message:'Connected successfully', redirect_to:'/portal/dashboard' } });
   } catch(e) { return handleError(res, e, 'Save config failed'); }
@@ -233,7 +267,7 @@ router.post('/save-config', authenticate, requireStatus('pending_setup','active'
 // ─── ACCOUNT HEALTH ─────────────────
 router.get('/account-health', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id);
     const health = await metaService.getAccountHealth(wa.waba_id, wa.phone_number_id, token);
     const qualityRating = normalizeQualityRating(health.phone?.quality_rating, wa.quality_rating);
     const nextMessagingTier = Number(health.phone?.messaging_limit_tier);
@@ -251,20 +285,30 @@ router.get('/account-health', authenticate, requireStatus('active'), async (req,
 
 // ─── BUSINESS PROFILE ─────────────────
 router.get('/business-profile', authenticate, requireStatus('active'), async (req, res) => {
-  try { const { wa, token } = await getWA(req.tenant._id); const p = await metaService.getBusinessProfile(wa.phone_number_id, token); return apiResponse(res, { data: p }); }
+  try { const { wa, token } = await getWA(req.tenant._id, req.query.account_id); const p = await metaService.getBusinessProfile(wa.phone_number_id, token); return apiResponse(res, { data: p }); }
   catch(e) { return handleError(res, e, 'Profile fetch failed'); }
 });
 router.put('/business-profile', authenticate, requireStatus('active'), async (req, res) => {
-  try { const { wa, token } = await getWA(req.tenant._id); const r = await metaService.updateBusinessProfile(wa.phone_number_id, token, req.body); return apiResponse(res, { data: r }); }
+  try { const { wa, token } = await getWA(req.tenant._id, req.query.account_id); const r = await metaService.updateBusinessProfile(wa.phone_number_id, token, req.body); return apiResponse(res, { data: r }); }
   catch(e) { return handleError(res, e, 'Profile update failed'); }
 });
 
 // ─── RECONNECT ─────────────────
 router.post('/reconnect', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const wa = await WhatsAppAccount.findOne({ tenant_id: req.tenant._id });
+    const wa = req.body.account_id
+      ? await WhatsAppAccount.findOne({ _id: req.body.account_id, tenant_id: req.tenant._id })
+      : (await WhatsAppAccount.findOne({ tenant_id: req.tenant._id, is_default: true })
+        || await WhatsAppAccount.findOne({ tenant_id: req.tenant._id }));
     if (wa) { wa.account_status='disconnected'; await wa.save(); }
-    await User.findByIdAndUpdate(req.user._id, { status:'pending_setup' });
+    const remaining = await WhatsAppAccount.countDocuments({ tenant_id: req.tenant._id, account_status: 'active' });
+    if (remaining === 0) {
+      await Tenant.findByIdAndUpdate(req.tenant._id, { setup_status: 'pending_setup' });
+      // Only change user status if this is their only/active tenant
+      if (req.user.status === 'active') {
+        await User.findByIdAndUpdate(req.user._id, { status: 'pending_setup' });
+      }
+    }
     return apiResponse(res, { data: { message:'Disconnected. Reconnect now.', redirect_to:'/portal/setup' } });
   } catch(e) { return handleError(res, e, 'Reconnect failed'); }
 });
@@ -318,10 +362,47 @@ router.post('/maintenance/clear-tenant-data', authenticate, requireStatus('activ
 });
 
 // ═══════════════════════════════════════
+// ACCOUNTS (Multi-phone management)
+// ═══════════════════════════════════════
+router.get('/accounts', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const accounts = await WhatsAppAccount.find({ tenant_id: req.tenant._id })
+      .select('-access_token_encrypted')
+      .sort({ is_default: -1, created_at: 1 })
+      .lean();
+    return apiResponse(res, { data: { accounts } });
+  } catch (e) { return handleError(res, e, 'Fetch accounts failed'); }
+});
+
+router.post('/accounts/:id/set-default', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const account = await WhatsAppAccount.findOne({ _id: req.params.id, tenant_id: req.tenant._id });
+    if (!account) return apiResponse(res, { status: 404, success: false, error: '[Platform] Account not found', error_source: 'platform' });
+    // Unset all defaults for this tenant
+    await WhatsAppAccount.updateMany({ tenant_id: req.tenant._id }, { $set: { is_default: false } });
+    // Set the chosen one as default
+    account.is_default = true;
+    await account.save();
+    return apiResponse(res, { data: { message: 'Default account updated', account_id: account._id } });
+  } catch (e) { return handleError(res, e, 'Set default failed'); }
+});
+
+router.patch('/accounts/:id', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const { label } = req.body;
+    const account = await WhatsAppAccount.findOne({ _id: req.params.id, tenant_id: req.tenant._id });
+    if (!account) return apiResponse(res, { status: 404, success: false, error: '[Platform] Account not found', error_source: 'platform' });
+    if (typeof label === 'string') account.label = label.trim();
+    await account.save();
+    return apiResponse(res, { data: { message: 'Account updated', account_id: account._id, label: account.label } });
+  } catch (e) { return handleError(res, e, 'Update account failed'); }
+});
+
+// ═══════════════════════════════════════
 // PHONE NUMBERS (Meta-direct)
 // ═══════════════════════════════════════
 router.get('/phone-numbers', authenticate, requireStatus('active'), async (req, res) => {
-  try { const { wa, token } = await getWA(req.tenant._id); const phones = await metaService.fetchPhoneNumbers(wa.waba_id, token); return apiResponse(res, { data: { phone_numbers:phones, active_phone_id:wa.phone_number_id } }); }
+  try { const { wa, token } = await getWA(req.tenant._id, req.query.account_id); const phones = await metaService.fetchPhoneNumbers(wa.waba_id, token); return apiResponse(res, { data: { phone_numbers:phones, active_phone_id:wa.phone_number_id } }); }
   catch(e) { return handleError(res, e, 'Phone fetch failed'); }
 });
 
@@ -329,7 +410,7 @@ router.post('/phone-numbers/register', authenticate, requireStatus('active'), as
   try {
     const { country_code, phone_number, verified_name } = req.body;
     if (!country_code || !phone_number || !verified_name?.trim()) return apiResponse(res, { status:400, success:false, error:'[Platform] country_code, phone_number, and verified_name required', error_source:'platform' });
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const name = verified_name.trim();
     const result = await metaService.registerPhoneNumber(wa.waba_id, token, { country_code, phone_number, verified_name: name });
     await Notification.create({ tenant_id:req.tenant._id, type:'system', title:'Phone Number Added', message:`New number +${country_code}${phone_number} (${name}) added on Meta. Request a verification code to finish setup.`, source:'meta', severity:'info' });
@@ -346,7 +427,7 @@ router.post('/phone-numbers/request-code', authenticate, requireStatus('active')
     const requestedLocale = typeof locale === 'string' && locale.trim()
       ? locale.trim()
       : (typeof language === 'string' && language.trim() ? language.trim() : 'en_US');
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const result = await metaService.requestVerificationCode(phone_number_id, token, method, requestedLocale);
     return apiResponse(res, { data: { ...result, requested:true, code_method:method, locale:requestedLocale } });
   }
@@ -358,7 +439,7 @@ router.post('/phone-numbers/verify', authenticate, requireStatus('active'), asyn
     const { phone_number_id, code, pin, data_localization_region } = req.body;
     if (!phone_number_id || !code) return apiResponse(res, { status:400, success:false, error:'[Platform] phone_number_id and code required', error_source:'platform' });
     if (!pin || !/^\d{6}$/.test(String(pin).replace(/\D/g,''))) return apiResponse(res, { status:400, success:false, error:'[Platform] pin must be a 6-digit number', error_source:'platform' });
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const verifyResult = await metaService.verifyPhoneCode(phone_number_id, token, code);
     const registerResult = pin ? await metaService.registerVerifiedPhone(phone_number_id, token, pin, data_localization_region) : null;
     const phone = await metaService.fetchPhoneDetail(phone_number_id, token).catch(() => null);
@@ -379,7 +460,7 @@ router.post('/phone-numbers/verify', authenticate, requireStatus('active'), asyn
 router.post('/phone-numbers/switch', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const { phone_number_id } = req.body;
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const pd = await metaService.fetchPhoneDetail(phone_number_id, token);
     wa.phone_number_id=phone_number_id; wa.display_phone_number=pd.display_phone_number; wa.display_name=pd.verified_name; wa.quality_rating=normalizeQualityRating(pd.quality_rating); wa.messaging_limit_tier=pd.messaging_limit_tier||1; await wa.save();
     return apiResponse(res, { data: { message:'Switched', phone:pd } });
@@ -398,7 +479,7 @@ router.post('/phone-numbers/deregister', authenticate, requireStatus('active'), 
       });
     }
 
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const currentPhones = await metaService.fetchPhoneNumbers(wa.waba_id, token);
     const currentPhone = currentPhones.find((phone) => phone.id === phone_number_id) || null;
     const remainingPhones = currentPhones.filter((phone) => phone.id !== phone_number_id);
@@ -522,6 +603,29 @@ const ensureTemplateVariables = (text = '', label = 'BODY') => {
   });
 };
 
+const normalizeMetaUrl = (value = '') => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  const placeholderTokens = withProtocol.match(/\{\{\d+\}\}/g) || [];
+  const hasPlaceholder = placeholderTokens.length > 0;
+  if (hasPlaceholder) {
+    if (placeholderTokens.length > 1 || placeholderTokens[0] !== '{{1}}' || !withProtocol.endsWith('{{1}}')) {
+      throw new Error('URL button supports only one dynamic placeholder {{1}} at the end');
+    }
+  }
+  const candidate = hasPlaceholder ? withProtocol.replace('{{1}}', 'sample') : withProtocol;
+  const parsed = new URL(candidate);
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('URL button requires http/https URL');
+  if (!parsed.hostname) throw new Error('URL button requires host');
+  const hostname = String(parsed.hostname || '').toLowerCase();
+  if (hostname === 'localhost' || /^[\d.]+$/.test(hostname)) throw new Error('URL button requires public domain URL');
+  const encodedPath = parsed.pathname ? encodeURI(parsed.pathname) : '';
+  const encodedSearch = parsed.search ? encodeURI(parsed.search) : '';
+  const suffix = hasPlaceholder ? '{{1}}' : '';
+  return `${parsed.protocol}//${parsed.host}${encodedPath}${encodedSearch}${suffix}`;
+};
+
 const ensureTemplateComponents = (components) => {
   if (!Array.isArray(components) || components.length === 0) {
     throw new Error('components must be a non-empty array');
@@ -558,7 +662,14 @@ const ensureTemplateComponents = (components) => {
       const text = String(button?.text || '').trim();
       if (!text) throw new Error('Button text is required');
       if (!['QUICK_REPLY', 'URL', 'PHONE_NUMBER'].includes(type)) throw new Error(`Unsupported button type: ${type}`);
-      if (type === 'URL' && !String(button?.url || '').trim()) throw new Error('URL button requires url');
+      if (type === 'URL') {
+        if (!String(button?.url || '').trim()) throw new Error('URL button requires url');
+        try {
+          button.url = normalizeMetaUrl(button.url);
+        } catch {
+          throw new Error(`Button "${text}" requires a valid URL`);
+        }
+      }
       if (type === 'PHONE_NUMBER' && !String(button?.phone_number || '').trim()) throw new Error('PHONE button requires phone_number');
     });
   }
@@ -590,6 +701,146 @@ const normalizeTemplateSampleMimeType = (format = '', upstreamMimeType = '') => 
   return inferMimeFromFormat(normalizedFormat);
 };
 
+// ─── CAROUSEL VALIDATION ──────────────────────────────────
+const validateCarouselCards = (cards) => {
+  if (!Array.isArray(cards) || cards.length < 2) {
+    throw new Error('Carousel requires at least 2 cards');
+  }
+  if (cards.length > 10) {
+    throw new Error('Carousel supports a maximum of 10 cards');
+  }
+
+  cards.forEach((card, index) => {
+    const label = `Card ${index + 1}`;
+
+    // Header is required for carousel cards (IMAGE type)
+    if (!card.header_media_handle) {
+      throw new Error(`${label}: header_media_handle is required (IMAGE header)`);
+    }
+    const handle = String(card.header_media_handle).trim();
+    if (/^https?:\/\//i.test(handle)) {
+      throw new Error(`${label}: header_media_handle expects a Meta media handle, not a URL`);
+    }
+
+    // Body text is required
+    if (!card.body_text || !String(card.body_text).trim()) {
+      throw new Error(`${label}: body_text is required`);
+    }
+    ensureTemplateVariables(card.body_text, `${label} BODY`);
+
+    // Buttons validation (optional, max 2 per card)
+    if (card.buttons) {
+      if (!Array.isArray(card.buttons)) {
+        throw new Error(`${label}: buttons must be an array`);
+      }
+      if (card.buttons.length > 2) {
+        throw new Error(`${label}: carousel cards support a maximum of 2 buttons`);
+      }
+      card.buttons.forEach((button, btnIndex) => {
+        const btnLabel = `${label} Button ${btnIndex + 1}`;
+        const type = String(button?.type || '').toUpperCase();
+        if (!['URL', 'QUICK_REPLY'].includes(type)) {
+          throw new Error(`${btnLabel}: type must be URL or QUICK_REPLY`);
+        }
+        if (!String(button?.text || '').trim()) {
+          throw new Error(`${btnLabel}: text is required`);
+        }
+        if (type === 'URL') {
+          if (!String(button?.url || '').trim()) {
+            throw new Error(`${btnLabel}: URL button requires url`);
+          }
+          try {
+            button.url = normalizeMetaUrl(button.url);
+          } catch {
+            throw new Error(`${btnLabel}: requires a valid URL`);
+          }
+        }
+      });
+    }
+  });
+};
+
+const buildCarouselComponents = (cards, bodyText, bodyVariables) => {
+  // Build the CAROUSEL component per Meta's API format
+  const carouselCards = cards.map((card, index) => {
+    const cardComponents = [];
+
+    // HEADER component (IMAGE)
+    cardComponents.push({
+      type: 'HEADER',
+      format: 'IMAGE',
+      example: {
+        header_handle: [String(card.header_media_handle).trim()],
+      },
+    });
+
+    // BODY component
+    const bodyComponent = { type: 'BODY', text: String(card.body_text).trim() };
+    const placeholders = parseTemplatePlaceholders(card.body_text);
+    if (placeholders.length > 0) {
+      const variables = Array.isArray(card.body_variables) ? card.body_variables : [];
+      if (variables.length < placeholders.length) {
+        throw new Error(`Card ${index + 1}: body_variables must have ${placeholders.length} example value(s) for placeholders`);
+      }
+      bodyComponent.example = {
+        body_text: [variables.slice(0, placeholders.length)],
+      };
+    }
+    cardComponents.push(bodyComponent);
+
+    // BUTTONS component (optional)
+    if (Array.isArray(card.buttons) && card.buttons.length > 0) {
+      const buttons = card.buttons.map((btn) => {
+        const type = String(btn.type).toUpperCase();
+        const base = { type, text: String(btn.text).trim() };
+        if (type === 'URL') {
+          base.url = btn.url;
+          // Check for dynamic URL
+          if (String(btn.url).includes('{{1}}')) {
+            base.example = [String(btn.url_example || 'https://example.com/sample').trim()];
+          }
+        }
+        return base;
+      });
+      cardComponents.push({ type: 'BUTTONS', buttons });
+    }
+
+    return { components: cardComponents };
+  });
+
+  // The top-level components for a carousel template
+  const components = [];
+
+  // BODY is still required at the template level
+  if (bodyText && String(bodyText).trim()) {
+    const topBody = { type: 'BODY', text: String(bodyText).trim() };
+    const topPlaceholders = parseTemplatePlaceholders(bodyText);
+    if (topPlaceholders.length > 0) {
+      const vars = Array.isArray(bodyVariables) ? bodyVariables : [];
+      topBody.example = { body_text: [vars.slice(0, topPlaceholders.length)] };
+    }
+    components.push(topBody);
+  }
+
+  // CAROUSEL component
+  components.push({
+    type: 'CAROUSEL',
+    cards: carouselCards,
+  });
+
+  return components;
+};
+
+// ─── LTO (Limited Time Offer) COMPONENT ───────────────────
+const buildLTOComponent = () => {
+  return {
+    type: 'LIMITED_TIME_OFFER',
+    limited_time_offer: {
+      has_expiration: true,
+    },
+  };
+};
+
 const renderTemplateBodyPreview = (bodyTemplate = '', bodyParameters = []) => {
   let rendered = String(bodyTemplate || '');
   bodyParameters.forEach((value, index) => {
@@ -610,7 +861,7 @@ router.post('/templates/media-handle', authenticate, requireStatus('active'), as
       return apiResponse(res, { status: 400, success: false, error: '[Platform] format must be IMAGE, VIDEO, or DOCUMENT', error_source: 'platform' });
     }
 
-    const { token } = await getWA(req.tenant._id);
+    const { token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const response = await fetch(mediaUrl);
     if (!response.ok) {
       return apiResponse(res, { status: 400, success: false, error: `[Platform] Could not fetch media URL (${response.status})`, error_source: 'platform' });
@@ -653,7 +904,7 @@ router.post('/templates/media-handle', authenticate, requireStatus('active'), as
 
 router.get('/templates', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const templates = await metaService.getTemplates(wa.waba_id, token);
     await reconcileTemplateNotifications(req.tenant._id, templates);
     if (verboseLogs) {
@@ -669,23 +920,103 @@ router.get('/templates', authenticate, requireStatus('active'), async (req, res)
 
 router.post('/templates', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const { name, category, language, components, allow_category_change } = req.body;
-    if (!name||!category||!components) return apiResponse(res, { status:400, success:false, error:'[Platform] name, category, components required', error_source:'platform' });
-    ensureTemplateComponents(components);
-    const { wa, token } = await getWA(req.tenant._id);
-    const result = await metaService.createTemplate(wa.waba_id, token, { name, category, language:language||'en', components, allow_category_change:allow_category_change!==false });
-    await Notification.create({ tenant_id:req.tenant._id, type:'template_pending', title:'Template Submitted', message:`Template "${name}" submitted to Meta for approval.`, source:'meta', severity:'info', link:'/portal/templates' });
-    return apiResponse(res, { status:201, data: { template: result } });
-  } catch(e) { return handleError(res, e, 'Template creation failed'); }
+    const {
+      name, category, language, components, allow_category_change,
+      is_carousel, carousel_cards,
+      is_lto,
+    } = req.body;
+
+    if (!name || !category) {
+      return apiResponse(res, { status: 400, success: false, error: '[Platform] name and category are required', error_source: 'platform' });
+    }
+
+    let finalComponents;
+
+    if (is_carousel) {
+      // ─── CAROUSEL TEMPLATE ────────────────────────────
+      if (!Array.isArray(carousel_cards) || carousel_cards.length < 2) {
+        return apiResponse(res, { status: 400, success: false, error: '[Platform] Carousel requires carousel_cards array with at least 2 cards', error_source: 'platform' });
+      }
+      validateCarouselCards(carousel_cards);
+
+      // Extract top-level body from components if provided
+      const topBody = Array.isArray(components)
+        ? components.find((c) => String(c?.type || '').toUpperCase() === 'BODY')
+        : null;
+      const bodyText = topBody?.text || '';
+      const bodyVariables = topBody?.example?.body_text?.[0] || [];
+
+      finalComponents = buildCarouselComponents(carousel_cards, bodyText, bodyVariables);
+
+      // Preserve HEADER if provided at top level (non-carousel header)
+      if (Array.isArray(components)) {
+        const topHeader = components.find((c) => String(c?.type || '').toUpperCase() === 'HEADER');
+        if (topHeader) {
+          finalComponents.unshift(topHeader);
+        }
+        // Preserve FOOTER if provided
+        const topFooter = components.find((c) => String(c?.type || '').toUpperCase() === 'FOOTER');
+        if (topFooter) {
+          finalComponents.push(topFooter);
+        }
+      }
+    } else {
+      // ─── STANDARD TEMPLATE ────────────────────────────
+      if (!components) {
+        return apiResponse(res, { status: 400, success: false, error: '[Platform] components are required', error_source: 'platform' });
+      }
+      ensureTemplateComponents(components);
+      finalComponents = components;
+    }
+
+    // ─── LTO (Limited Time Offer) ─────────────────────
+    if (is_lto) {
+      // Ensure category is MARKETING for LTO
+      if (String(category).toUpperCase() !== 'MARKETING') {
+        return apiResponse(res, { status: 400, success: false, error: '[Platform] Limited Time Offer templates require MARKETING category', error_source: 'platform' });
+      }
+
+      // Add LIMITED_TIME_OFFER component
+      const ltoComponent = buildLTOComponent();
+      finalComponents.push(ltoComponent);
+
+      // Ensure BUTTONS exist with at least one button that includes
+      // the copy_code or URL for the offer — LTO requires a CTA button.
+      // We don't enforce button presence here since Meta will validate,
+      // but we add the expiration_time_ms parameter to the LTO component.
+    }
+
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
+    const result = await metaService.createTemplate(wa.waba_id, token, {
+      name,
+      category,
+      language: language || 'en',
+      components: finalComponents,
+      allow_category_change: allow_category_change !== false,
+    });
+
+    const templateType = is_carousel ? 'Carousel template' : is_lto ? 'LTO template' : 'Template';
+    await Notification.create({
+      tenant_id: req.tenant._id,
+      type: 'template_pending',
+      title: 'Template Submitted',
+      message: `${templateType} "${name}" submitted to Meta for approval.`,
+      source: 'meta',
+      severity: 'info',
+      link: '/portal/templates',
+    });
+
+    return apiResponse(res, { status: 201, data: { template: result } });
+  } catch (e) { return handleError(res, e, 'Template creation failed'); }
 });
 
 router.post('/templates/:id/edit', authenticate, requireStatus('active'), async (req, res) => {
-  try { const { wa, token } = await getWA(req.tenant._id); return apiResponse(res, { data: { template: await metaService.editTemplate(req.params.id, token, req.body) } }); }
+  try { const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id); return apiResponse(res, { data: { template: await metaService.editTemplate(req.params.id, token, req.body) } }); }
   catch(e) { return handleError(res, e, 'Template edit failed'); }
 });
 
 router.delete('/templates/:name', authenticate, requireStatus('active'), async (req, res) => {
-  try { const { wa, token } = await getWA(req.tenant._id); await metaService.deleteTemplate(wa.waba_id, token, req.params.name); return apiResponse(res, { data: { message:'Deleted from Meta' } }); }
+  try { const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id); await metaService.deleteTemplate(wa.waba_id, token, req.params.name); return apiResponse(res, { data: { message:'Deleted from Meta' } }); }
   catch(e) { return handleError(res, e, 'Template delete failed'); }
 });
 
@@ -696,7 +1027,7 @@ router.post('/messages/send', authenticate, requireStatus('active'), async (req,
   try {
     const { to, text } = req.body;
     if (!to||!text) return apiResponse(res, { status:400, success:false, error:'[Platform] to and text required', error_source:'platform' });
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const normalizedTo = to.replace(/[^0-9]/g,'');
     if (verboseLogs) {
       console.info('[Platform Send][Text][Request]', {
@@ -731,7 +1062,7 @@ router.post('/messages/send-template', authenticate, requireStatus('active'), as
   try {
     const { to, template_name, language, components, header_media_url, header_type, body_parameters } = req.body;
     if (!to||!template_name) return apiResponse(res, { status:400, success:false, error:'[Platform] to and template_name required', error_source:'platform' });
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const normalizedTo = to.replace(/[^0-9]/g,'');
     let resolvedComponents = Array.isArray(components) ? components : [];
 
@@ -857,7 +1188,7 @@ router.post('/messages/send-media', authenticate, requireStatus('active'), async
   try {
     const { to, type, url, caption, filename } = req.body;
     if (!to||!type||!url) return apiResponse(res, { status:400, success:false, error:'[Platform] to, type, url required', error_source:'platform' });
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const normalizedTo = to.replace(/[^0-9]/g,'');
     if (verboseLogs) {
       console.info('[Platform Send][Media][Request]', {
@@ -900,7 +1231,7 @@ router.post('/messages/send-media', authenticate, requireStatus('active'), async
 });
 
 router.post('/messages/mark-read', authenticate, requireStatus('active'), async (req, res) => {
-  try { const { wa_message_id } = req.body; const { wa, token } = await getWA(req.tenant._id); return apiResponse(res, { data: await metaService.markMessageRead(wa.phone_number_id, token, wa_message_id) }); }
+  try { const { wa_message_id } = req.body; const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id); return apiResponse(res, { data: await metaService.markMessageRead(wa.phone_number_id, token, wa_message_id) }); }
   catch(e) { return handleError(res, e, 'Mark read failed'); }
 });
 
@@ -909,7 +1240,7 @@ router.post('/messages/mark-read', authenticate, requireStatus('active'), async 
 // ═══════════════════════════════════════
 router.get('/media/:mediaId', authenticate, requireStatus('active'), async (req, res) => {
   try {
-    const { token } = await getWA(req.tenant._id);
+    const { token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const media = await metaService.getMediaDetails(req.params.mediaId, token);
 
     if (!media?.url) {
@@ -963,7 +1294,7 @@ router.get('/media/:mediaId', authenticate, requireStatus('active'), async (req,
 router.get('/analytics/conversations', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const { start, end, granularity } = req.query;
-    const { wa, token } = await getWA(req.tenant._id);
+    const { wa, token } = await getWA(req.tenant._id, req.query.account_id || req.body?.account_id);
     const now = new Date();
     return apiResponse(res, { data: { analytics: await metaService.getConversationAnalytics(wa.waba_id, token, start||new Date(now-30*86400000).toISOString(), end||now.toISOString(), granularity||'DAILY') } });
   } catch(e) { return handleError(res, e, 'Analytics failed'); }

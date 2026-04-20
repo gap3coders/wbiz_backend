@@ -100,11 +100,11 @@ const sendVerificationEmail = async (user, token) => {
 
   await sendEmail({
     to: user.email,
-    subject: 'Verify your email - WhatsApp SaaS',
+    subject: 'Verify your email - WBIZ.IN',
     html: `
       <div style="font-family: 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px;">
         <div style="text-align: center; margin-bottom: 32px;">
-          <h1 style="color: #075E54; font-size: 28px; margin: 0;">WhatsApp SaaS</h1>
+          <h1 style="color: #075E54; font-size: 28px; margin: 0;">WBIZ.IN</h1>
         </div>
         <div style="background: #ffffff; border-radius: 12px; padding: 40px; border: 1px solid #e5e7eb;">
           <h2 style="color: #1a1a1a; font-size: 22px; margin: 0 0 16px;">Welcome, ${user.full_name}!</h2>
@@ -130,11 +130,11 @@ const sendPasswordResetEmail = async (user, token) => {
 
   await sendEmail({
     to: user.email,
-    subject: 'Reset your password - WhatsApp SaaS',
+    subject: 'Reset your password - WBIZ.IN',
     html: `
       <div style="font-family: 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px;">
         <div style="text-align: center; margin-bottom: 32px;">
-          <h1 style="color: #075E54; font-size: 28px; margin: 0;">WhatsApp SaaS</h1>
+          <h1 style="color: #075E54; font-size: 28px; margin: 0;">WBIZ.IN</h1>
         </div>
         <div style="background: #ffffff; border-radius: 12px; padding: 40px; border: 1px solid #e5e7eb;">
           <h2 style="color: #1a1a1a; font-size: 22px; margin: 0 0 16px;">Password Reset Request</h2>

@@ -10,6 +10,9 @@ const Notification = require('../models/Notification');
 const Campaign = require('../models/Campaign');
 const { processInboundAutoResponses } = require('../services/autoResponseService');
 const { parsePhoneInput } = require('../utils/phone');
+const Conversation = require('../models/Conversation');
+const WhatsAppFlow = require('../models/WhatsAppFlow');
+const FlowSubmission = require('../models/FlowSubmission');
 const { emitToTenant } = require('../services/socketService');
 
 const router = express.Router();
@@ -299,6 +302,24 @@ const buildIncomingContent = (message) => {
   if (message.type === 'location') return '[Location]';
   if (message.type === 'reaction') return message.reaction?.emoji || '[Reaction]';
   if (message.type === 'sticker') return '[Sticker]';
+  if (message.type === 'interactive') {
+    const ir = message.interactive;
+    if (ir?.type === 'button_reply') return ir.button_reply?.title || '[Button Reply]';
+    if (ir?.type === 'list_reply') return ir.list_reply?.title || '[List Reply]';
+    if (ir?.type === 'nfm_reply') {
+      try {
+        const responseJson = JSON.parse(ir.nfm_reply?.response_json || '{}');
+        const keys = Object.keys(responseJson).filter(k => k !== 'flow_token');
+        if (keys.length > 0) {
+          const summary = keys.map(k => `${k}: ${responseJson[k]}`).join(', ');
+          return `[Flow Response] ${summary.slice(0, 200)}`;
+        }
+      } catch (e) { /* ignore parse errors */ }
+      return '[Flow Response]';
+    }
+    return '[Interactive]';
+  }
+  if (message.type === 'button') return message.button?.text || '[Button]';
   return `[${message.type || 'unknown'}]`;
 };
 
@@ -310,6 +331,26 @@ const processMessageChange = async (tenantId, change) => {
     if (!phone || !inbound.id) continue;
     const name = value.contacts?.find((contact) => contact.wa_id === phone)?.profile?.name || value.contacts?.[0]?.profile?.name || '';
     const previewText = buildIncomingContent(inbound);
+
+    // ─── DEBUG: Log full inbound payload for interactive messages ───
+    console.log('[Meta Webhook][DEBUG INBOUND]', JSON.stringify({
+      message_type: inbound.type,
+      message_id: inbound.id,
+      from: phone,
+      previewText,
+      has_interactive: !!inbound.interactive,
+      interactive_type: inbound.interactive?.type || null,
+      interactive_keys: inbound.interactive ? Object.keys(inbound.interactive) : [],
+      button_reply: inbound.interactive?.button_reply || null,
+      list_reply: inbound.interactive?.list_reply || null,
+      has_button: !!inbound.button,
+      button_text: inbound.button?.text || null,
+      button_payload: inbound.button?.payload || null,
+      full_message_keys: Object.keys(inbound),
+      raw_interactive: inbound.interactive || null,
+      raw_button: inbound.button || null,
+    }, null, 2));
+    // ─── END DEBUG ───
 
     logInboundStage('message_received', {
       tenant_id: String(tenantId),
@@ -369,7 +410,20 @@ const processMessageChange = async (tenantId, change) => {
     }
 
     if (existingInbound) {
-      if (config.verboseLogs) {
+      // If old record has generic content but we now have better data, patch it
+      const oldMsg = await Message.findById(existingInbound._id).lean();
+      const oldContent = String(oldMsg?.content || '').trim().toLowerCase();
+      const isGenericContent = !oldContent || oldContent.startsWith('[') || oldContent === 'interactive message';
+      if (isGenericContent && previewText && !previewText.startsWith('[')) {
+        await Message.findByIdAndUpdate(existingInbound._id, {
+          $set: {
+            content: previewText,
+            message_type: inbound.type || oldMsg?.message_type || 'unknown',
+            interactive_payload: inbound.type === 'interactive' ? (inbound.interactive || null) : (oldMsg?.interactive_payload || null),
+          },
+        });
+        console.log('[Meta Webhook][Patched Stale Inbound]', { message_id: inbound.id, old_content: oldContent, new_content: previewText });
+      } else if (config.verboseLogs) {
         console.info('[Meta Webhook][Inbound Duplicate Ignored]', {
           tenant_id: String(tenantId),
           from: phone,
@@ -386,6 +440,15 @@ const processMessageChange = async (tenantId, change) => {
         message_id: inbound.id || null,
       });
 
+      // ─── DEBUG: Log what we're about to store ───
+      console.log('[Meta Webhook][DEBUG STORE]', JSON.stringify({
+        message_type: inbound.type || 'unknown',
+        content: previewText,
+        interactive_payload: inbound.type === 'interactive' ? (inbound.interactive || null) : null,
+        wa_message_id: inbound.id,
+      }));
+      // ─── END DEBUG ───
+
       await Message.create({
         tenant_id: tenantId,
         contact_phone: phone,
@@ -398,6 +461,7 @@ const processMessageChange = async (tenantId, change) => {
         media_id: inbound.image?.id || inbound.document?.id || inbound.video?.id || inbound.audio?.id || null,
         media_mime: inbound.image?.mime_type || inbound.document?.mime_type || inbound.video?.mime_type || inbound.audio?.mime_type || null,
         media_filename: inbound.document?.filename || null,
+        interactive_payload: inbound.type === 'interactive' ? (inbound.interactive || null) : null,
         timestamp: inbound.timestamp ? new Date(parseInt(inbound.timestamp, 10) * 1000) : new Date(),
       });
 
@@ -405,6 +469,46 @@ const processMessageChange = async (tenantId, change) => {
         tenant_id: String(tenantId),
         from: phone,
         message_id: inbound.id || null,
+      });
+
+      // Update 24-hour conversation window + conversation metadata
+      const windowExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const updatedConversation = await Conversation.findOneAndUpdate(
+        { tenant_id: tenantId, contact_phone: phone },
+        {
+          $set: {
+            last_customer_message_at: new Date(),
+            window_expires_at: windowExpiry,
+            window_status: 'open',
+            last_message_at: new Date(),
+            last_message_preview: previewText,
+            last_message_direction: 'inbound',
+            last_message_status: 'delivered',
+            contact_name: name || undefined,
+            status: 'open',
+          },
+          $inc: { unread_count: 1 },
+          $setOnInsert: {
+            tenant_id: tenantId,
+            contact_phone: phone,
+          },
+        },
+        { new: true, upsert: true }
+      );
+
+      // Emit real-time update to all connected frontend clients
+      emitToTenant(tenantId, 'conversation:updated', {
+        conversation: {
+          _id: updatedConversation._id,
+          contact_phone: phone,
+          contact_name: name || updatedConversation.contact_name,
+          last_message_preview: previewText,
+          last_message_direction: 'inbound',
+          last_message_at: new Date(),
+          unread_count: updatedConversation.unread_count,
+          window_status: 'open',
+          window_expires_at: windowExpiry,
+        },
       });
     } catch (error) {
       if (error?.code === 11000) {
@@ -491,6 +595,54 @@ const processMessageChange = async (tenantId, change) => {
       }).catch(() => null);
     }
 
+    // ─── FLOW COMPLETION HANDLING (nfm_reply) ───
+    if (inbound.type === 'interactive' && inbound.interactive?.type === 'nfm_reply') {
+      try {
+        const rawResponseJson = inbound.interactive.nfm_reply?.response_json || '{}';
+        const responseData = JSON.parse(rawResponseJson);
+        const flowToken = responseData.flow_token || inbound.interactive.nfm_reply?.body || null;
+
+        // Try to find which flow this belongs to — check all tenant flows
+        // Meta does not include flow_id in nfm_reply, so we record against all or match by token
+        const flowId = responseData.flow_id || null;
+
+        await FlowSubmission.create({
+          tenant_id: tenantId,
+          flow_id: flowId || 'unknown',
+          contact_phone: phone,
+          contact_name: name,
+          wa_message_id: inbound.id,
+          response_data: responseData,
+          status: 'completed',
+          submitted_at: new Date(),
+        });
+
+        // If we know the flow_id, increment the completed stat
+        if (flowId) {
+          await WhatsAppFlow.updateOne(
+            { tenant_id: tenantId, flow_id: flowId },
+            { $inc: { 'stats.completed': 1 } }
+          );
+        }
+
+        logInboundStage('flow_submission_saved', {
+          tenant_id: String(tenantId),
+          from: phone,
+          message_id: inbound.id || null,
+          flow_id: flowId || 'unknown',
+        });
+      } catch (flowError) {
+        console.error('[Meta Webhook][Flow Submission Failed]', {
+          version: WEBHOOK_HANDLER_VERSION,
+          tenant_id: String(tenantId),
+          from: phone,
+          message_id: inbound.id || null,
+          error: flowError.message,
+        });
+      }
+    }
+    // ─── END FLOW COMPLETION HANDLING ───
+
     if (config.verboseLogs) {
       console.info('[Meta Webhook][Inbound Message]', {
         tenant_id: String(tenantId),
@@ -521,23 +673,33 @@ const processMessageChange = async (tenantId, change) => {
       });
     }
 
-    const updatedMessage = await Message.findOneAndUpdate(
+    // Try to find and update existing message — do NOT upsert phantom records
+    let updatedMessage = await Message.findOneAndUpdate(
       { tenant_id: tenantId, wa_message_id: statusUpdate.id },
-      {
-        $set: update,
-        $setOnInsert: {
-          tenant_id: tenantId,
-          contact_phone: statusUpdate.recipient_id || 'unknown',
-          contact_name: '',
-          direction: 'outbound',
-          message_type: 'unknown',
-          content: '[Meta status update]',
-          wa_message_id: statusUpdate.id,
-          timestamp: statusUpdate.timestamp ? new Date(parseInt(statusUpdate.timestamp, 10) * 1000) : new Date(),
-        },
-      },
-      { upsert: true, new: true }
+      { $set: update },
+      { new: true }
     );
+
+    // If message not found yet (race condition: status arrives before record is saved),
+    // retry once after a short delay
+    if (!updatedMessage) {
+      await new Promise(r => setTimeout(r, 1500));
+      updatedMessage = await Message.findOneAndUpdate(
+        { tenant_id: tenantId, wa_message_id: statusUpdate.id },
+        { $set: update },
+        { new: true }
+      );
+    }
+
+    // Emit real-time status update for all messages
+    if (updatedMessage) {
+      emitToTenant(tenantId, 'message:status', {
+        message_id: updatedMessage._id,
+        wa_message_id: statusUpdate.id,
+        status: statusUpdate.status || 'unknown',
+        contact_phone: updatedMessage.contact_phone,
+      });
+    }
 
     if (updatedMessage?.campaign_id) {
       await refreshCampaignStatsFromMessages(tenantId, updatedMessage.campaign_id).catch(() => null);

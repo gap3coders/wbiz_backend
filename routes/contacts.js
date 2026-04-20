@@ -1,6 +1,7 @@
 const express = require('express');
 const { authenticate, requireStatus } = require('../middleware/auth');
 const Contact = require('../models/Contact');
+const CustomFieldDefinition = require('../models/CustomFieldDefinition');
 const Message = require('../models/Message');
 const WhatsAppAccount = require('../models/WhatsAppAccount');
 const { apiResponse } = require('../utils/helpers');
@@ -91,6 +92,13 @@ router.get('/', authenticate, requireStatus('active'), async (req, res) => {
       filter.wa_exists = waStatus;
     }
 
+    const subscription = String(req.query.subscription || '').trim();
+    if (subscription === 'subscribed') {
+      filter.opt_in = { $ne: false };
+    } else if (subscription === 'unsubscribed') {
+      filter.opt_in = false;
+    }
+
     const [contacts, total, labels, tags] = await Promise.all([
       Contact.find(filter).sort({ updated_at: -1 }).skip(skip).limit(limit).lean(),
       Contact.countDocuments(filter),
@@ -125,6 +133,103 @@ router.get('/', authenticate, requireStatus('active'), async (req, res) => {
       success: false,
       error: '[Platform] Failed to fetch contacts',
     });
+  }
+});
+
+/* ── EXPORT TO CSV (must be before /:id) ───────────────── */
+router.get('/export/csv', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const filter = { tenant_id: req.tenant._id };
+    if (req.query.tag) filter.tags = req.query.tag;
+    if (req.query.subscription) filter.subscription_status = req.query.subscription;
+    if (req.query.wa_exists) filter.wa_exists = req.query.wa_exists;
+
+    const [contacts, fieldDefs] = await Promise.all([
+      Contact.find(filter).sort({ created_at: -1 }).lean(),
+      CustomFieldDefinition.find({ tenant_id: req.tenant._id, is_active: true }).sort({ sort_order: 1 }).lean(),
+    ]);
+
+    const standardHeaders = ['Name', 'Phone', 'Country Code', 'Email', 'WhatsApp Status', 'Subscription', 'Tags', 'Notes', 'Birthday', 'Opt In', 'Created At'];
+    const customHeaders = fieldDefs.map((d) => d.field_label || d.field_name);
+    const headers = [...standardHeaders, ...customHeaders];
+
+    const escapeCSV = (val) => {
+      const str = String(val ?? '');
+      return str.includes(',') || str.includes('"') || str.includes('\n') ? `"${str.replace(/"/g, '""')}"` : str;
+    };
+
+    const rows = contacts.map((c) => {
+      const standardCols = [
+        escapeCSV(c.name || c.wa_name || ''),
+        escapeCSV(c.phone),
+        escapeCSV(c.country_code),
+        escapeCSV(c.email),
+        escapeCSV(c.wa_exists),
+        escapeCSV(c.subscription_status || 'subscribed'),
+        escapeCSV((c.tags || []).join('; ')),
+        escapeCSV(c.notes),
+        escapeCSV(c.birthday),
+        escapeCSV(c.opt_in !== false ? 'Yes' : 'No'),
+        escapeCSV(c.created_at ? new Date(c.created_at).toISOString() : ''),
+      ];
+      const cf = c.custom_fields && typeof c.custom_fields === 'object' ? c.custom_fields : {};
+      const customCols = fieldDefs.map((d) => escapeCSV(cf[d.field_name] ?? ''));
+      return [...standardCols, ...customCols].join(',');
+    });
+
+    const csv = [headers.join(','), ...rows].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="contacts_export_${Date.now()}.csv"`);
+    return res.send(csv);
+  } catch (error) {
+    console.error('[Contacts][Export CSV]', { tenant_id: String(req.tenant?._id), error: error.message });
+    return apiResponse(res, { status: 500, success: false, error: 'Export failed' });
+  }
+});
+
+/* ── SUBSCRIPTION UPDATE (bulk) ────────────────────────── */
+router.post('/subscription', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const { contact_ids, status } = req.body;
+    if (!Array.isArray(contact_ids) || !contact_ids.length) {
+      return apiResponse(res, { status: 400, success: false, error: 'contact_ids array required' });
+    }
+    if (!['subscribed', 'unsubscribed', 'pending'].includes(status)) {
+      return apiResponse(res, { status: 400, success: false, error: 'Invalid status' });
+    }
+
+    const updates = { subscription_status: status, opt_in: status === 'subscribed' };
+    if (status === 'unsubscribed') {
+      updates.unsubscribed_at = new Date();
+      if (req.body.reason) updates.unsubscribe_reason = req.body.reason;
+    } else if (status === 'subscribed') {
+      updates.subscribed_at = new Date();
+      updates.unsubscribe_reason = '';
+    }
+
+    const result = await Contact.updateMany(
+      { _id: { $in: contact_ids }, tenant_id: req.tenant._id },
+      updates,
+    );
+    return apiResponse(res, { data: { modified: result.modifiedCount } });
+  } catch (error) {
+    console.error('[Contacts][Subscription]', { error: error.message });
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to update subscription' });
+  }
+});
+
+/* ── Get contact lists this contact belongs to ── */
+router.get('/:id/lists', authenticate, requireStatus('active'), async (req, res) => {
+  try {
+    const ContactList = require('../models/ContactList');
+    const lists = await ContactList.find({
+      tenant_id: req.tenant._id,
+      contacts: req.params.id,
+    }).select('_id name color contact_count').lean();
+    return apiResponse(res, { data: { lists } });
+  } catch (error) {
+    console.error('[Contacts][Lists]', { error: error.message });
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to fetch contact lists' });
   }
 });
 
@@ -492,7 +597,8 @@ router.post('/verify-whatsapp', authenticate, requireStatus('active'), async (re
       return apiResponse(res, { status: 400, success: false, error: 'phones array required' });
     }
 
-    const wa = await WhatsAppAccount.findOne({ tenant_id: req.tenant._id });
+    const wa = await WhatsAppAccount.findOne({ tenant_id: req.tenant._id, is_default: true })
+      || await WhatsAppAccount.findOne({ tenant_id: req.tenant._id });
     if (!wa) {
       return apiResponse(res, { status: 404, success: false, error: 'No WhatsApp account' });
     }
@@ -544,6 +650,35 @@ router.post('/import', authenticate, requireStatus('active'), async (req, res) =
     const rows = Array.isArray(req.body?.contacts) ? req.body.contacts : null;
     if (!rows) {
       return apiResponse(res, { status: 400, success: false, error: 'contacts array required' });
+    }
+
+    const autoCreateFields = req.body.auto_create_fields === true;
+    const unmappedColumns = Array.isArray(req.body.unmapped_columns) ? req.body.unmapped_columns : [];
+    const autoCreatedFields = [];
+
+    if (autoCreateFields && unmappedColumns.length) {
+      const existingDefs = await CustomFieldDefinition.find({ tenant_id: req.tenant._id }).lean();
+      const existingNames = new Set(existingDefs.map((d) => d.field_name));
+
+      for (const column of unmappedColumns) {
+        const fieldName = String(column || '')
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, '_')
+          .replace(/[^a-z0-9_]/g, '');
+        if (!fieldName || existingNames.has(fieldName)) continue;
+
+        await CustomFieldDefinition.create({
+          tenant_id: req.tenant._id,
+          field_name: fieldName,
+          field_label: String(column || '').trim(),
+          field_type: 'text',
+          is_required: false,
+          created_by: req.user?._id || null,
+        });
+        existingNames.add(fieldName);
+        autoCreatedFields.push({ field_name: fieldName, field_label: String(column || '').trim() });
+      }
     }
 
     let created = 0;
@@ -659,6 +794,7 @@ router.post('/import', authenticate, requireStatus('active'), async (req, res) =
         skipped,
         processed: rows.length,
         results,
+        auto_created_fields: autoCreatedFields,
       },
     });
   } catch (error) {

@@ -195,6 +195,7 @@ const storeOutboundMessage = async ({
     template_name: templateName,
     template_params: templateParams,
     wa_message_id: waMessageId,
+    message_source: 'auto_response',
     status: 'sent',
     timestamp: new Date(),
   });
@@ -220,6 +221,14 @@ const evaluateRule = async ({ tenantId, rule, message, phone }) => {
 
   if (rule.trigger_type === 'fallback') {
     return true;
+  }
+
+  if (rule.trigger_type === 'unsubscribe') {
+    return keywordMatches(rule, extractInboundText(message));
+  }
+
+  if (rule.trigger_type === 'resubscribe') {
+    return keywordMatches(rule, extractInboundText(message));
   }
 
   return false;
@@ -311,6 +320,45 @@ const executeRule = async ({ tenantId, rule, inboundMessage, waAccount, contact 
       });
     }
 
+    // ── Subscription status updates ──
+    if (rule.trigger_type === 'unsubscribe' && contact) {
+      await Contact.findByIdAndUpdate(contact._id, {
+        opt_in: false,
+        subscription_status: 'unsubscribed',
+        unsubscribed_at: new Date(),
+        unsubscribe_reason: `Auto: keyword "${context.incoming_text}"`,
+      });
+      console.log(`[AutoResponse] Contact ${contactPhone} unsubscribed via keyword`);
+      await Notification.create({
+        tenant_id: tenantId,
+        type: 'contact_unsubscribed',
+        title: 'Contact Unsubscribed',
+        message: `${context.contact_name} (${contactPhone}) unsubscribed via keyword "${context.incoming_text}"`,
+        source: 'platform',
+        severity: 'info',
+        link: '/portal/contacts',
+      }).catch(() => null);
+    }
+
+    if (rule.trigger_type === 'resubscribe' && contact) {
+      await Contact.findByIdAndUpdate(contact._id, {
+        opt_in: true,
+        subscription_status: 'subscribed',
+        subscribed_at: new Date(),
+        unsubscribe_reason: '',
+      });
+      console.log(`[AutoResponse] Contact ${contactPhone} resubscribed via keyword`);
+      await Notification.create({
+        tenant_id: tenantId,
+        type: 'contact_resubscribed',
+        title: 'Contact Resubscribed',
+        message: `${context.contact_name} (${contactPhone}) resubscribed via keyword "${context.incoming_text}"`,
+        source: 'platform',
+        severity: 'success',
+        link: '/portal/contacts',
+      }).catch(() => null);
+    }
+
     await AutoResponseLog.create({
       tenant_id: tenantId,
       rule_id: rule._id,
@@ -374,7 +422,7 @@ const processInboundAutoResponses = async ({ tenantId, inboundMessage }) => {
   if (!tenantId || !contactPhone) return;
 
   const [waAccount, contact, rules] = await Promise.all([
-    WhatsAppAccount.findOne({ tenant_id: tenantId, account_status: 'active' }),
+    WhatsAppAccount.findOne({ tenant_id: tenantId, account_status: 'active', is_default: true }).then(a => a || WhatsAppAccount.findOne({ tenant_id: tenantId, account_status: 'active' })),
     Contact.findOne({
       tenant_id: tenantId,
       phone: contactPhone,

@@ -31,7 +31,7 @@ const autoResponseRuleSchema = new mongoose.Schema(
     active: { type: Boolean, default: true },
     trigger_type: {
       type: String,
-      enum: ['keyword', 'welcome', 'away', 'fallback'],
+      enum: ['keyword', 'welcome', 'away', 'fallback', 'unsubscribe', 'resubscribe'],
       required: true,
       default: 'keyword',
     },

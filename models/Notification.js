@@ -18,5 +18,7 @@ const notificationSchema = new mongoose.Schema(
 notificationSchema.index({ tenant_id: 1, created_at: -1 });
 notificationSchema.index({ tenant_id: 1, read: 1 });
 notificationSchema.index({ tenant_id: 1, type: 1, created_at: -1 });
+notificationSchema.index({ tenant_id: 1, source: 1, created_at: -1 });
+notificationSchema.index({ tenant_id: 1, severity: 1 });
 
 module.exports = mongoose.model('Notification', notificationSchema);

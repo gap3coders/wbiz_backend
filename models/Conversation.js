@@ -56,6 +56,19 @@ const conversationSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    last_customer_message_at: {
+      type: Date,
+      default: null,
+    },
+    window_expires_at: {
+      type: Date,
+      default: null,
+    },
+    window_status: {
+      type: String,
+      enum: ['open', 'expired', 'none'],
+      default: 'none',
+    },
     metadata: {
       type: mongoose.Schema.Types.Mixed,
       default: {},

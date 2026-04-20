@@ -48,6 +48,11 @@ module.exports = {
 
   encryptionKey: process.env.ENCRYPTION_KEY,
 
+  redis: {
+    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
+    maxRetriesPerRequest: null, // required by BullMQ
+  },
+
   meta: {
     appId: process.env.META_APP_ID,
     appSecret: process.env.META_APP_SECRET,
@@ -63,7 +68,7 @@ module.exports = {
     secure: smtpSecure,
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
-    fromName: process.env.SMTP_FROM_NAME || 'WhatsApp SaaS',
+    fromName: process.env.SMTP_FROM_NAME || 'WBIZ.IN',
     fromEmail: process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER,
   },
 };

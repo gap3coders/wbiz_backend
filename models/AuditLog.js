@@ -36,5 +36,8 @@ const auditLogSchema = new mongoose.Schema(
 );
 
 auditLogSchema.index({ tenant_id: 1, created_at: -1 });
+auditLogSchema.index({ tenant_id: 1, action: 1, created_at: -1 });
+auditLogSchema.index({ tenant_id: 1, entity_type: 1, created_at: -1 });
+auditLogSchema.index({ user_id: 1, created_at: -1 });
 
 module.exports = mongoose.model('AuditLog', auditLogSchema);

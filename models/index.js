@@ -13,4 +13,5 @@ module.exports = {
   MediaAsset: require('./MediaAsset'),
   AutoResponseRule: require('./AutoResponseRule'),
   AutoResponseLog: require('./AutoResponseLog'),
+  CustomFieldDefinition: require('./CustomFieldDefinition'),
 };

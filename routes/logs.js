@@ -16,6 +16,11 @@ const clamp = (value, min, max, fallback) => {
   return Math.min(Math.max(parsed, min), max);
 };
 
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 const isPrivateIpv4 = (hostname) => {
   if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return false;
   if (hostname.startsWith('10.')) return true;
@@ -142,25 +147,56 @@ const summarizeWebhookEvent = (event) => {
 router.get('/whatsapp', authenticate, requireStatus('active'), async (req, res) => {
   try {
     const hours = clamp(req.query.hours, 1, 24 * 30, 72);
-    const limitEvents = clamp(req.query.limit_events, 5, 100, 25);
-    const limitMessages = clamp(req.query.limit_messages, 5, 100, 25);
+    const requestedWebhookPage = parsePositiveInt(req.query.webhook_page, 1);
+    const requestedOutboundPage = parsePositiveInt(req.query.outbound_page, 1);
+    const limitEvents = clamp(req.query.limit_events, 5, 100, 10);
+    const limitMessages = clamp(req.query.limit_messages, 5, 100, 10);
     const since = new Date(Date.now() - hours * 60 * 60 * 1000);
     const pendingCutoff = new Date(Date.now() - 5 * 60 * 1000);
     const tenantId = req.tenant._id;
+    const webhookQuery = { tenant_id: tenantId, created_at: { $gte: since } };
+    const outboundQuery = { tenant_id: tenantId, direction: 'outbound', timestamp: { $gte: since } };
 
-    const [waAccount, events, outboundMessages, eventStatusAgg, messageStatusAgg, lastWebhook] = await Promise.all([
-      WhatsAppAccount.findOne({ tenant_id: tenantId }).lean(),
-      WebhookEvent.find({ tenant_id: tenantId, created_at: { $gte: since } }).sort({ created_at: -1 }).limit(limitEvents).lean(),
-      Message.find({ tenant_id: tenantId, direction: 'outbound', timestamp: { $gte: since } }).sort({ timestamp: -1 }).limit(limitMessages).lean(),
+    const [waAccount, totalWebhookEvents, totalOutboundMessages, eventStatusAgg, messageStatusAgg, lastWebhook, pendingDeliveryUpdates] = await Promise.all([
+      WhatsAppAccount.findOne({ tenant_id: tenantId, is_default: true }).lean().then(a => a || WhatsAppAccount.findOne({ tenant_id: tenantId }).lean()),
+      WebhookEvent.countDocuments(webhookQuery),
+      Message.countDocuments(outboundQuery),
       WebhookEvent.aggregate([
-        { $match: { tenant_id: tenantId, created_at: { $gte: since } } },
+        { $match: webhookQuery },
         { $group: { _id: '$processing_status', count: { $sum: 1 } } },
       ]),
       Message.aggregate([
-        { $match: { tenant_id: tenantId, direction: 'outbound', timestamp: { $gte: since } } },
+        { $match: outboundQuery },
         { $group: { _id: '$status', count: { $sum: 1 } } },
       ]),
       WebhookEvent.findOne({ tenant_id: tenantId }).sort({ created_at: -1 }).lean(),
+      Message.countDocuments({
+        ...outboundQuery,
+        status: { $in: ['queued', 'sent'] },
+        $or: [
+          { updated_at: { $lte: pendingCutoff } },
+          { created_at: { $lte: pendingCutoff } },
+          { timestamp: { $lte: pendingCutoff } },
+        ],
+      }),
+    ]);
+
+    const webhookPages = Math.max(1, Math.ceil(totalWebhookEvents / limitEvents));
+    const outboundPages = Math.max(1, Math.ceil(totalOutboundMessages / limitMessages));
+    const webhookPage = Math.min(requestedWebhookPage, webhookPages);
+    const outboundPage = Math.min(requestedOutboundPage, outboundPages);
+
+    const [events, outboundMessages] = await Promise.all([
+      WebhookEvent.find(webhookQuery)
+        .sort({ created_at: -1 })
+        .skip((webhookPage - 1) * limitEvents)
+        .limit(limitEvents)
+        .lean(),
+      Message.find(outboundQuery)
+        .sort({ timestamp: -1 })
+        .skip((outboundPage - 1) * limitMessages)
+        .limit(limitMessages)
+        .lean(),
     ]);
 
     const webhookTotals = { processed: 0, failed: 0, skipped: 0, pending: 0 };
@@ -168,8 +204,6 @@ router.get('/whatsapp', authenticate, requireStatus('active'), async (req, res) 
 
     const messageTotals = { queued: 0, sent: 0, delivered: 0, read: 0, failed: 0 };
     messageStatusAgg.forEach((row) => { messageTotals[row._id] = row.count; });
-
-    const pendingDeliveryUpdates = outboundMessages.filter((message) => ['queued', 'sent'].includes(message.status) && new Date(message.updated_at || message.created_at || message.timestamp) <= pendingCutoff).length;
 
     const diagnostics = [];
     const metaWebhook = {
@@ -335,7 +369,7 @@ router.get('/whatsapp', authenticate, requireStatus('active'), async (req, res) 
       data: {
         summary: {
           window_hours: hours,
-          webhook_events: events.length,
+          webhook_events: totalWebhookEvents,
           processed_webhooks: webhookTotals.processed,
           failed_webhooks: webhookTotals.failed,
           skipped_webhooks: webhookTotals.skipped,
@@ -354,6 +388,20 @@ router.get('/whatsapp', authenticate, requireStatus('active'), async (req, res) 
         meta_webhook: metaWebhook,
         webhook_events: events.map(summarizeWebhookEvent),
         outbound_messages: outboundMessages,
+        pagination: {
+          webhook_events: {
+            page: webhookPage,
+            limit: limitEvents,
+            total: totalWebhookEvents,
+            pages: webhookPages,
+          },
+          outbound_messages: {
+            page: outboundPage,
+            limit: limitMessages,
+            total: totalOutboundMessages,
+            pages: outboundPages,
+          },
+        },
       },
     });
   } catch (error) {

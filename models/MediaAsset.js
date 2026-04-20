@@ -58,5 +58,7 @@ const mediaAssetSchema = new mongoose.Schema(
 );
 
 mediaAssetSchema.index({ tenant_id: 1, asset_type: 1, created_at: -1 });
+mediaAssetSchema.index({ tenant_id: 1, created_at: -1 });
+mediaAssetSchema.index({ tenant_id: 1, mime_type: 1 });
 
 module.exports = mongoose.model('MediaAsset', mediaAssetSchema);

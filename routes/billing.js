@@ -1,158 +1,265 @@
 const express = require('express');
-const WhatsAppAccount = require('../models/WhatsAppAccount');
-const Message = require('../models/Message');
-const { authenticate, requireStatus } = require('../middleware/auth');
-const { decrypt } = require('../services/encryptionService');
-const metaService = require('../services/metaService');
 const { apiResponse } = require('../utils/helpers');
-
+const { authenticate } = require('../middleware/auth');
+const Plan = require('../models/Plan');
+const Tenant = require('../models/Tenant');
+const Subscription = require('../models/Subscription');
+const SystemConfig = require('../models/SystemConfig');
 const router = express.Router();
 
-router.use(authenticate, requireStatus('active'));
-
-router.get('/overview', async (req, res) => {
+// GET /plans — public endpoint, no auth needed
+router.get('/plans', async (req, res) => {
   try {
-    const waAccount = await WhatsAppAccount.findOne({ tenant_id: req.tenant._id });
-    if (!waAccount) {
-      return apiResponse(res, {
-        status: 404,
-        success: false,
-        error: 'No WhatsApp account connected',
-      });
+    const plans = await Plan.find({ is_active: true }).sort({ sort_order: 1 }).lean();
+    return apiResponse(res, { data: { plans } });
+  } catch (error) {
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to fetch plans' });
+  }
+});
+
+// POST /start-trial — start 7-day free trial
+router.post('/start-trial', authenticate, async (req, res) => {
+  try {
+    const { plan_slug } = req.body;
+    const tenant = await Tenant.findById(req.user.tenant_id);
+    if (!tenant) return apiResponse(res, { status: 404, success: false, error: 'Tenant not found' });
+
+    // Check if trial already used
+    if (tenant.trial_used) {
+      return apiResponse(res, { status: 400, success: false, error: 'Free trial has already been used for this account' });
     }
 
-    const accessToken = decrypt(waAccount.access_token_encrypted);
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const trialDays = await SystemConfig.getValue('trial_days', 7);
+    const plan = await Plan.findOne({ slug: plan_slug || 'starter', is_active: true });
+    if (!plan) return apiResponse(res, { status: 400, success: false, error: 'Invalid plan' });
 
-    const recentPricedMessagesPromise = Message.find({
-      tenant_id: req.tenant._id,
-      direction: 'outbound',
-      $or: [{ message_timestamp: { $gte: thirtyDaysAgo } }, { timestamp: { $gte: thirtyDaysAgo } }],
-      'payload.latest_status_payload.pricing': { $exists: true },
-    })
-      .sort({ message_timestamp: -1, timestamp: -1 })
-      .limit(25)
-      .lean();
+    const trialEnds = new Date(Date.now() + trialDays * 24 * 60 * 60 * 1000);
 
-    const [billingInfo, discoveredWabas, recentPricedMessages] = await Promise.all([
-      metaService.fetchWABABillingInfo(waAccount.waba_id, accessToken),
-      metaService.fetchWABAs(accessToken),
-      recentPricedMessagesPromise,
-    ]);
+    await Tenant.findByIdAndUpdate(tenant._id, {
+      plan: plan.slug,
+      plan_status: 'trial',
+      trial_ends_at: trialEnds,
+      trial_used: true,
+      message_limit_monthly: plan.message_limit,
+      seats_limit: plan.seats_limit,
+      setup_status: 'pending_setup',
+    });
 
-    const matchedWaba = discoveredWabas.find((item) => item.id === waAccount.waba_id) || null;
-    const creditLines = matchedWaba?.business_id
-      ? await metaService.fetchExtendedCredits(matchedWaba.business_id, accessToken).catch((error) => {
-          console.warn('[Billing Route] Failed to fetch extended credits', error.message);
-          return [];
-        })
-      : [];
+    // Update user status for first-time onboarding
+    const User = require('../models/User');
+    if (req.user.status === 'pending_plan') {
+      await User.findByIdAndUpdate(req.user._id, { status: 'pending_setup' });
+    }
 
-    const pricingSummary = recentPricedMessages.reduce(
-      (accumulator, message) => {
-        const pricing = message.payload?.latest_status_payload?.pricing || {};
-        const category = String(pricing.category || 'unknown').toLowerCase();
-        const pricingModel = String(pricing.pricing_model || 'unknown').toLowerCase();
-        const billable = pricing.billable !== false;
+    return apiResponse(res, { data: { message: 'Trial started', trial_ends_at: trialEnds, redirect_to: '/portal/setup' } });
+  } catch (error) {
+    console.error('[Billing][StartTrial]', error.message);
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to start trial' });
+  }
+});
 
-        if (billable) {
-          accumulator.billable_count += 1;
-        } else {
-          accumulator.non_billable_count += 1;
-        }
+// POST /create-order — create Razorpay order for plan purchase
+router.post('/create-order', authenticate, async (req, res) => {
+  try {
+    const { plan_slug, billing_cycle = 'monthly' } = req.body;
+    const plan = await Plan.findOne({ slug: plan_slug, is_active: true });
+    if (!plan) return apiResponse(res, { status: 400, success: false, error: 'Invalid plan' });
 
-        accumulator.by_category[category] = (accumulator.by_category[category] || 0) + 1;
-        accumulator.by_pricing_model[pricingModel] = (accumulator.by_pricing_model[pricingModel] || 0) + 1;
+    const amount = billing_cycle === 'yearly' ? plan.price_yearly : plan.price_monthly;
+    if (!amount || amount <= 0) return apiResponse(res, { status: 400, success: false, error: 'Plan has no valid price' });
 
-        return accumulator;
+    const razorpayKeyId = await SystemConfig.getValue('razorpay_key_id', '');
+    const razorpayKeySecret = await SystemConfig.getValue('razorpay_key_secret', '');
+
+    if (!razorpayKeyId || !razorpayKeySecret) {
+      return apiResponse(res, { status: 500, success: false, error: 'Payment gateway not configured' });
+    }
+
+    const Razorpay = require('razorpay');
+    const razorpay = new Razorpay({ key_id: razorpayKeyId, key_secret: razorpayKeySecret });
+
+    const order = await razorpay.orders.create({
+      amount: Math.round(amount * 100), // Razorpay expects paise
+      currency: plan.currency || 'INR',
+      receipt: `sub_${req.user.tenant_id}_${Date.now()}`,
+      notes: {
+        tenant_id: String(req.user.tenant_id),
+        user_id: String(req.user._id),
+        plan_slug: plan.slug,
+        billing_cycle,
       },
-      {
-        billable_count: 0,
-        non_billable_count: 0,
-        by_category: {},
-        by_pricing_model: {},
-      }
-    );
+    });
 
-    const notices = [];
-
-    if (!billingInfo.primary_funding_id && creditLines.length === 0) {
-      notices.push({
-        id: 'billing_setup_missing',
-        title: 'Payment setup not exposed for this WABA yet',
-        message:
-          'Meta did not return a payment method or shared line of credit for this connected account. This can happen on test resources or when billing is managed outside the current app permissions.',
-        source: 'meta',
-      });
-    }
-
-    notices.push({
-      id: 'invoice_api_limit',
-      title: 'Invoice history is not available in this portal yet',
-      message:
-        'The Meta endpoints wired here expose payment setup, funding identifiers, and pricing signals from status webhooks, but not a full invoice/payment ledger for direct portal rendering.',
-      source: 'app',
+    // Create pending subscription record
+    const subscription = await Subscription.create({
+      tenant_id: req.user.tenant_id,
+      user_id: req.user._id,
+      plan_slug: plan.slug,
+      plan_name: plan.name,
+      billing_cycle,
+      amount,
+      currency: plan.currency || 'INR',
+      status: 'pending',
+      razorpay_order_id: order.id,
     });
 
     return apiResponse(res, {
       data: {
-        account: {
-          waba_id: waAccount.waba_id,
-          display_name: waAccount.display_name,
-          display_phone_number: waAccount.display_phone_number,
-          currency: billingInfo.currency || null,
-          business_review_status: billingInfo.account_review_status || null,
-          primary_funding_id: billingInfo.primary_funding_id || null,
-          purchase_order_number: billingInfo.purchase_order_number || null,
-          business_id: matchedWaba?.business_id || null,
-          business_name: matchedWaba?.business_name || null,
-          line_of_credit_count: creditLines.length,
-          credit_lines: creditLines,
-          sender_registration_status: waAccount.sender_registration_status || 'unknown',
-          messaging_limit_tier: waAccount.messaging_limit_tier || null,
-        },
-        pricing_summary: pricingSummary,
-        recent_priced_messages: recentPricedMessages.map((message) => {
-          const pricing = message.payload?.latest_status_payload?.pricing || {};
-          return {
-            _id: message._id,
-            message_timestamp: message.message_timestamp || message.timestamp || null,
-            status: message.status,
-            to: message.to,
-            contact: message.contact_id
-              ? message.contact_id
-              : {
-                  name: message.contact_name || '',
-                  profile_name: message.contact_name || '',
-                  phone_number: message.contact_phone || message.to || '',
-                },
-            category: pricing.category || 'unknown',
-            pricing_model: pricing.pricing_model || 'unknown',
-            billable: pricing.billable !== false,
-          };
-        }),
-        notices,
+        order_id: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        key_id: razorpayKeyId,
+        subscription_id: subscription._id,
+        plan,
       },
     });
   } catch (error) {
-    console.error('[Billing Route] Failed to load billing overview', error);
-    return apiResponse(res, {
-      status: error.metaError ? 502 : 500,
-      success: false,
-      error: error.message || 'Failed to load billing overview',
-      meta: error.metaError
-        ? {
-            source: 'meta',
-            code: error.metaError.code || null,
-            subcode: error.metaError.error_subcode || null,
-            type: error.metaError.type || null,
-            trace_id: error.metaError.fbtrace_id || null,
-          }
-        : {
-            source: 'app',
-          },
+    console.error('[Billing][CreateOrder]', error.message);
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to create payment order' });
+  }
+});
+
+// POST /verify-payment — verify Razorpay payment and activate subscription
+router.post('/verify-payment', authenticate, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, subscription_id } = req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return apiResponse(res, { status: 400, success: false, error: 'Missing payment verification data' });
+    }
+
+    const razorpayKeySecret = await SystemConfig.getValue('razorpay_key_secret', '');
+    const crypto = require('crypto');
+    const expectedSignature = crypto
+      .createHmac('sha256', razorpayKeySecret)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+
+    if (expectedSignature !== razorpay_signature) {
+      // Mark subscription as failed
+      if (subscription_id) {
+        await Subscription.findByIdAndUpdate(subscription_id, { status: 'failed' });
+      }
+      return apiResponse(res, { status: 400, success: false, error: 'Payment verification failed' });
+    }
+
+    // Find the subscription
+    const subscription = await Subscription.findOne({ razorpay_order_id });
+    if (!subscription) return apiResponse(res, { status: 404, success: false, error: 'Subscription not found' });
+
+    // Calculate subscription period
+    const now = new Date();
+    const endsAt = new Date(now);
+    if (subscription.billing_cycle === 'yearly') {
+      endsAt.setFullYear(endsAt.getFullYear() + 1);
+    } else {
+      endsAt.setMonth(endsAt.getMonth() + 1);
+    }
+
+    // Update subscription
+    subscription.razorpay_payment_id = razorpay_payment_id;
+    subscription.razorpay_signature = razorpay_signature;
+    subscription.status = 'active';
+    subscription.starts_at = now;
+    subscription.ends_at = endsAt;
+    await subscription.save();
+
+    // Update tenant
+    const plan = await Plan.findOne({ slug: subscription.plan_slug });
+    await Tenant.findByIdAndUpdate(subscription.tenant_id, {
+      plan: subscription.plan_slug,
+      plan_status: 'active',
+      subscription_ends_at: endsAt,
+      message_limit_monthly: plan?.message_limit || 1000,
+      seats_limit: plan?.seats_limit || 3,
+      setup_status: 'pending_setup',
     });
+
+    // Update user status only for first-time onboarding
+    const User = require('../models/User');
+    const user = await User.findById(subscription.user_id);
+    if (user && user.status === 'pending_plan') {
+      await User.findByIdAndUpdate(user._id, { status: 'pending_setup' });
+    }
+
+    return apiResponse(res, {
+      data: {
+        message: 'Payment verified and subscription activated',
+        subscription: { id: subscription._id, plan: subscription.plan_name, ends_at: endsAt },
+        redirect_to: '/portal/setup',
+      },
+    });
+  } catch (error) {
+    console.error('[Billing][VerifyPayment]', error.message);
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to verify payment' });
+  }
+});
+
+// GET /subscription — get current subscription info
+router.get('/subscription', authenticate, async (req, res) => {
+  try {
+    const tenant = await Tenant.findById(req.user.tenant_id).lean();
+    if (!tenant) return apiResponse(res, { status: 404, success: false, error: 'Tenant not found' });
+
+    const plan = await Plan.findOne({ slug: tenant.plan }).lean();
+    const activeSubscription = await Subscription.findOne({
+      tenant_id: tenant._id, status: 'active',
+    }).sort({ created_at: -1 }).lean();
+
+    const isExpired = tenant.plan_status === 'expired' ||
+      (tenant.plan_status === 'trial' && tenant.trial_ends_at && new Date() > tenant.trial_ends_at) ||
+      (tenant.plan_status === 'active' && tenant.subscription_ends_at && new Date() > tenant.subscription_ends_at);
+
+    return apiResponse(res, {
+      data: {
+        plan: plan || null,
+        plan_status: tenant.plan_status,
+        trial_ends_at: tenant.trial_ends_at,
+        subscription_ends_at: tenant.subscription_ends_at,
+        lifetime_access: tenant.lifetime_access,
+        trial_used: tenant.trial_used,
+        is_expired: isExpired,
+        current_subscription: activeSubscription,
+      },
+    });
+  } catch (error) {
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to fetch subscription' });
+  }
+});
+
+// GET /history — get payment history
+router.get('/history', authenticate, async (req, res) => {
+  try {
+    const subscriptions = await Subscription.find({ tenant_id: req.user.tenant_id })
+      .sort({ created_at: -1 }).limit(20).lean();
+    return apiResponse(res, { data: { subscriptions } });
+  } catch (error) {
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to fetch history' });
+  }
+});
+
+// POST /cancel — cancel subscription
+router.post('/cancel', authenticate, async (req, res) => {
+  try {
+    const tenant = await Tenant.findById(req.user.tenant_id);
+    if (!tenant) return apiResponse(res, { status: 404, success: false, error: 'Tenant not found' });
+    if (tenant.plan_status === 'cancelled') return apiResponse(res, { status: 400, success: false, error: 'Already cancelled' });
+    if (tenant.lifetime_access) return apiResponse(res, { status: 400, success: false, error: 'Lifetime access cannot be cancelled' });
+
+    // Mark tenant as cancelled but keep access until subscription_ends_at
+    tenant.plan_status = 'cancelled';
+    await tenant.save();
+
+    // Update active subscription
+    await Subscription.updateMany(
+      { tenant_id: req.user.tenant_id, status: 'active' },
+      { $set: { status: 'cancelled', cancelled_at: new Date() } }
+    );
+
+    return apiResponse(res, { data: { message: 'Subscription cancelled. Access continues until the end of your billing period.' } });
+  } catch (error) {
+    console.error('[Billing][Cancel]', { error: error.message });
+    return apiResponse(res, { status: 500, success: false, error: 'Failed to cancel subscription' });
   }
 });
 

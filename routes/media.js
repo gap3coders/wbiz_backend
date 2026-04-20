@@ -85,25 +85,45 @@ const toClientAsset = (asset) => ({
   updated_at: asset.updated_at,
 });
 
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 router.get('/assets', async (req, res) => {
   try {
     const search = String(req.query.search || '').trim();
     const assetType = String(req.query.asset_type || '').trim().toLowerCase();
-    const limit = Math.min(Math.max(Number(req.query.limit) || 60, 1), 200);
+    const assetTypes = String(req.query.asset_types || '')
+      .split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => ['image', 'video', 'document', 'audio'].includes(value));
+    const requestedPage = parsePositiveInt(req.query.page, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 18, 1), 200);
 
     const query = { tenant_id: req.tenant._id };
     if (assetType && ['image', 'video', 'document', 'audio'].includes(assetType)) {
       query.asset_type = assetType;
+    } else if (assetTypes.length) {
+      query.asset_type = { $in: Array.from(new Set(assetTypes)) };
     }
     if (search) {
       query.original_name = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
     }
 
-    const assets = await MediaAsset.find(query).sort({ created_at: -1 }).limit(limit);
-    const countsAgg = await MediaAsset.aggregate([
+    const [total, countsAgg] = await Promise.all([
+      MediaAsset.countDocuments(query),
+      MediaAsset.aggregate([
       { $match: { tenant_id: req.tenant._id } },
       { $group: { _id: '$asset_type', count: { $sum: 1 } } },
+      ]),
     ]);
+
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const page = Math.min(requestedPage, pages);
+    const skip = (page - 1) * limit;
+
+    const assets = await MediaAsset.find(query).sort({ created_at: -1 }).skip(skip).limit(limit);
 
     const counts = countsAgg.reduce(
       (accumulator, item) => ({ ...accumulator, [item._id]: item.count }),
@@ -114,6 +134,12 @@ router.get('/assets', async (req, res) => {
       data: {
         assets: assets.map(toClientAsset),
         counts,
+        pagination: {
+          page,
+          limit,
+          total,
+          pages,
+        },
       },
     });
   } catch (error) {

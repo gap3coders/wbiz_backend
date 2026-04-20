@@ -41,7 +41,7 @@ const userSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['pending_verification', 'pending_setup', 'active', 'suspended'],
+      enum: ['pending_verification', 'pending_approval', 'pending_plan', 'pending_setup', 'active', 'suspended'],
       default: 'pending_verification',
     },
     role: {
@@ -66,6 +66,10 @@ const userSchema = new mongoose.Schema(
       ref: 'Tenant',
       default: null,
     },
+    tenants: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Tenant',
+    }],
     login_attempts: {
       type: Number,
       default: 0,
@@ -101,4 +105,32 @@ userSchema.methods.toSafeJSON = function () {
   return obj;
 };
 
-module.exports = mongoose.model('User', userSchema);
+const User = mongoose.model('User', userSchema);
+
+// ─── Startup migration: backfill tenants array for existing users ───
+(async () => {
+  try {
+    const usersToMigrate = await User.find({
+      tenant_id: { $ne: null },
+      $or: [{ tenants: { $exists: false } }, { tenants: { $size: 0 } }],
+    }).select('_id tenant_id');
+
+    if (usersToMigrate.length > 0) {
+      const bulkOps = usersToMigrate.map((u) => ({
+        updateOne: {
+          filter: { _id: u._id },
+          update: { $addToSet: { tenants: u.tenant_id } },
+        },
+      }));
+      await User.bulkWrite(bulkOps);
+      console.log(`[User Migration] Backfilled tenants array for ${usersToMigrate.length} user(s)`);
+    }
+  } catch (err) {
+    // Non-fatal — migration will retry on next boot
+    if (err.name !== 'MongoNotConnectedError') {
+      console.warn('[User Migration] tenants backfill skipped:', err.message);
+    }
+  }
+})();
+
+module.exports = User;

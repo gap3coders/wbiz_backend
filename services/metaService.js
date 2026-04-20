@@ -164,6 +164,8 @@ const editTemplate = async (tplId, t, data) => fetchJson(`${graphApiBase}/${tplI
 const deleteTemplate = async (wabaId, t, name) => fetchJson(`${graphApiBase}/${wabaId}/message_templates?name=${name}`, { method:'DELETE', headers:{Authorization:`Bearer ${t}`} });
 
 // ═══ MESSAGING ═══
+const sendRawPayload = async (phoneId, t, payload) => fetchJson(`${graphApiBase}/${phoneId}/messages`, { method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${t}`}, body:JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', ...payload }) });
+
 const sendTextMessage = async (phoneId, t, to, text) => fetchJson(`${graphApiBase}/${phoneId}/messages`, { method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${t}`}, body:JSON.stringify({messaging_product:'whatsapp',recipient_type:'individual',to,type:'text',text:{preview_url:true,body:text}}) });
 
 const sendTemplateMessage = async (phoneId, t, to, name, lang, components) => {
@@ -232,6 +234,116 @@ const getMediaUrl = async (mediaId, t) => {
   return details.url || null;
 };
 
+// ═══ WHATSAPP FLOWS ═══
+const getFlows = async (wabaId, t) => {
+  const d = await fetchJson(`${graphApiBase}/${wabaId}/flows?fields=id,name,status,categories,validation_errors,json_version,data_api_version,preview,updated_at&access_token=${t}`);
+  return d.data || [];
+};
+
+const getFlowDetail = async (flowId, t) => {
+  return fetchJson(`${graphApiBase}/${flowId}?fields=id,name,status,categories,validation_errors,json_version,data_api_version,preview,updated_at&access_token=${t}`);
+};
+
+const createFlow = async (wabaId, t, name, categories = []) => {
+  const payload = { name, categories };
+  return fetchJson(`${graphApiBase}/${wabaId}/flows`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+    body: JSON.stringify(payload),
+  });
+};
+
+const updateFlowJSON = async (flowId, t, flowJSON) => {
+  // Meta requires multipart/form-data with the flow JSON file
+  const jsonStr = typeof flowJSON === 'string' ? flowJSON : JSON.stringify(flowJSON);
+  console.log('[Meta] updateFlowJSON for flow', flowId, '— JSON being sent:', jsonStr);
+  const formData = new FormData();
+  formData.append('file', new Blob([jsonStr], { type: 'application/json' }), 'flow.json');
+  const response = await fetch(`${graphApiBase}/${flowId}/assets`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${t}` },
+    body: formData,
+  });
+  const data = await response.json();
+  console.log('[Meta] updateFlowJSON response:', JSON.stringify(data));
+  if (data.error) throw new MetaApiError(data.error.message, data.error, response.status);
+  return data;
+};
+
+const publishFlow = async (flowId, t) => {
+  return fetchJson(`${graphApiBase}/${flowId}/publish`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${t}` },
+  });
+};
+
+const deleteFlow = async (flowId, t) => {
+  return fetchJson(`${graphApiBase}/${flowId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${t}` },
+  });
+};
+
+const deprecateFlow = async (flowId, t) => {
+  return fetchJson(`${graphApiBase}/${flowId}/deprecate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${t}` },
+  });
+};
+
+const getFlowAssets = async (flowId, t) => {
+  return fetchJson(`${graphApiBase}/${flowId}/assets?access_token=${t}`);
+};
+
+const sendFlowMessage = async (phoneId, t, to, flowId, flowToken, flowCta, headerText, bodyText, footerText, firstScreenId) => {
+  const interactive = {
+    type: 'flow',
+    body: { text: bodyText },
+    action: {
+      name: 'flow',
+      parameters: {
+        flow_message_version: '3',
+        flow_token: flowToken || 'unused',
+        flow_id: flowId,
+        flow_cta: flowCta || 'Open',
+      },
+    },
+  };
+
+  // Only include header if text is non-empty (Meta rejects empty header)
+  if (headerText && headerText.trim()) {
+    interactive.header = { type: 'text', text: headerText.trim() };
+  }
+
+  // Only include footer if text is non-empty (Meta rejects empty footer)
+  if (footerText && footerText.trim()) {
+    interactive.footer = { text: footerText.trim() };
+  }
+
+  // If we know the first screen, use navigate action; otherwise omit to use Meta default
+  if (firstScreenId) {
+    interactive.action.parameters.flow_action = 'navigate';
+    interactive.action.parameters.flow_action_payload = {
+      screen: firstScreenId,
+    };
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'interactive',
+    interactive,
+  };
+
+  console.log('[Meta] sendFlowMessage payload:', JSON.stringify(payload, null, 2));
+  return fetchJson(`${graphApiBase}/${phoneId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+    body: JSON.stringify(payload),
+  });
+};
+
 // ═══ ANALYTICS ═══
 const getConversationAnalytics = async (wabaId, t, start, end, granularity='DAILY') => {
   const s = Math.floor(new Date(start).getTime()/1000), e = Math.floor(new Date(end).getTime()/1000);
@@ -246,6 +358,7 @@ module.exports = {
   subscribeWebhook, getAppSubscriptions, getWabaSubscribedApps, getAccountHealth, getBusinessProfile, updateBusinessProfile,
   fetchWABABillingInfo, fetchExtendedCredits,
   getTemplates, createTemplate, editTemplate, deleteTemplate,
-  sendTextMessage, sendTemplateMessage, sendMediaMessage, uploadMedia, uploadTemplateSampleHandle, markMessageRead, getMediaDetails, getMediaUrl,
+  sendRawPayload, sendTextMessage, sendTemplateMessage, sendMediaMessage, uploadMedia, uploadTemplateSampleHandle, markMessageRead, getMediaDetails, getMediaUrl,
   getConversationAnalytics,
+  getFlows, getFlowDetail, createFlow, updateFlowJSON, publishFlow, deleteFlow, deprecateFlow, getFlowAssets, sendFlowMessage,
 };

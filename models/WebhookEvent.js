@@ -30,4 +30,10 @@ const webhookEventSchema = new mongoose.Schema(
   }
 );
 
+// ── Indexes ───────────────────────────────────────────
+webhookEventSchema.index({ tenant_id: 1, created_at: -1 });
+webhookEventSchema.index({ processing_status: 1, created_at: -1 });
+webhookEventSchema.index({ tenant_id: 1, event_type: 1, created_at: -1 });
+webhookEventSchema.index({ waba_id: 1, created_at: -1 });
+
 module.exports = mongoose.model('WebhookEvent', webhookEventSchema);
